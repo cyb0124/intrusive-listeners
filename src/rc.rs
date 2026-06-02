@@ -1,6 +1,7 @@
 use alloc::rc::{Rc, Weak};
 use core::cell::Cell;
 use core::marker::{PhantomData, PhantomPinned};
+use core::mem::forget;
 use core::pin::Pin;
 use core::ptr::{self, DynMetadata};
 
@@ -64,8 +65,20 @@ impl<T> Drop for Guard<T> {
 
 impl<T> Registry<T> {
     pub fn register(self: Pin<&Self>, handler: impl Handler<T> + 'static) -> Guard<T> {
-        // TODO: implement.
-        todo!()
+        let next = self.head.get();
+        let node = Rc::new(Node {
+            meta: ptr::metadata(&handler as &dyn Handler<T>),
+            prev: (&raw const *self).map_addr(|x| x | 1).cast::<()>().into(),
+            next: next.into(),
+            handler,
+        }) as Rc<Node<T, dyn Handler<T>>>;
+        forget(Rc::downgrade(&node));
+        let ptr = Rc::into_raw(node).to_raw_parts().0;
+        self.head.set(ptr);
+        if !next.is_null() {
+            unsafe { &*resolve::<T>(next) }.prev.set(ptr);
+        }
+        Guard { node: ptr, _p: PhantomData }
     }
 
     pub fn broadcast(&self, event: &T) {
