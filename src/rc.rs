@@ -28,26 +28,37 @@ struct Node<T, H: Handler<T> + ?Sized> {
     handler: H,
 }
 
+unsafe fn resolve<T>(node: *const ()) -> *const Node<T, dyn Handler<T>> {
+    // In the `Weak` case this may read a node already dropped-in-place, but the `meta` field should still be intact.
+    let meta = unsafe { *node.cast::<DynMetadata<dyn Handler<T>>>() };
+    ptr::from_raw_parts::<Node<T, dyn Handler<T>>>(node, meta)
+}
+
 impl<T> Drop for Registry<T> {
     fn drop(&mut self) {
-        let mut next = self.head.get();
-        while !next.is_null() {
-            let meta = unsafe { *next.cast::<DynMetadata<dyn Handler<T>>>() };
-            let node = ptr::from_raw_parts::<Node<T, dyn Handler<T>>>(next, meta);
-            let node = unsafe { Rc::from_raw(node) };
-            next = node.next.get();
+        let mut node = self.head.get();
+        while !node.is_null() {
+            node = unsafe { Rc::from_raw(resolve::<T>(node)) }.next.get();
         }
     }
 }
 
 impl<T> Drop for Guard<T> {
     fn drop(&mut self) {
-        // This may read a node already dropped-in-place, but the `meta` field should still be intact.
-        let meta = unsafe { *self.node.cast::<DynMetadata<dyn Handler<T>>>() };
-        let node = ptr::from_raw_parts::<Node<T, dyn Handler<T>>>(self.node, meta);
-        let Some(node) = unsafe { Weak::from_raw(node) }.upgrade() else { return };
-        // TODO: remove node from the list.
-        todo!()
+        let ptr = unsafe { resolve::<T>(self.node) };
+        let Some(node) = unsafe { Weak::from_raw(ptr) }.upgrade() else { return };
+        let (prev, next) = (node.prev.get(), node.next.get());
+        // Temporarily leaks a strong count; decremented later.
+        if prev.addr() & 1 == 1 {
+            let registry = prev.map_addr(|x| x & !1).cast::<Registry<T>>();
+            unsafe { &*registry }.head.set(next);
+        } else {
+            unsafe { &*resolve::<T>(prev) }.next.set(next);
+        }
+        if !next.is_null() {
+            unsafe { &*resolve::<T>(next) }.prev.set(prev);
+        }
+        unsafe { Rc::decrement_strong_count(ptr) };
     }
 }
 
