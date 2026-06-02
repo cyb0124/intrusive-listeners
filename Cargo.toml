@@ -2,5 +2,11 @@
 name = "intrusive-listeners"
 version = "0.1.0"
 edition = "2024"
+authors = ["Yibo Cao <cyb@ieee.org>"]
+description = "A compact type-erased event-listener registry"
+license = "MIT"
+repository = "https://github.com/cyb0124/intrusive-listeners"
+keywords = ["intrusive", "listener", "event", "observer", "no_std"]
+categories = ["data-structures", "no-std", "rust-patterns"]
 
 [dependencies]

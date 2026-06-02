@@ -20,7 +20,7 @@
 //! - **Listener cancelling other listeners**\
 //!   Cancelled listeners further down the queue will not receive the in-flight event.
 //! - **Listener calling [`broadcast`](rc::Registry::broadcast) again in its callback (recursive notification)**\
-//!   Callbacks for the new event will immediately inside the nested `broadcast` call.
+//!   Callbacks for the new event will immediately run inside the nested `broadcast` call.
 //! - **Registering new listeners inside a listener callback**\
 //!   The new listeners will not receive the in-flight event.
 //!
@@ -37,3 +37,7 @@
 extern crate alloc;
 
 pub mod rc;
+
+// Run tests using:
+// - cargo miri test
+// - MIRIFLAGS=-Zmiri-tree-borrows cargo miri test

@@ -3,7 +3,7 @@ use core::cell::Cell;
 use core::marker::{PhantomData, PhantomPinned};
 use core::mem::forget;
 use core::pin::Pin;
-use core::ptr::{self, DynMetadata};
+use core::ptr::{self, DynMetadata, null};
 
 pub trait Listener<T> {
     fn accept(&self, event: &T);
@@ -77,7 +77,13 @@ impl<T> Drop for Guard<T> {
     }
 }
 
+impl<T> Default for Registry<T> {
+    fn default() -> Self { Self::new() }
+}
+
 impl<T> Registry<T> {
+    pub const fn new() -> Self { Self { head: Cell::new(null()), _p: PhantomData, _pin: PhantomPinned } }
+
     pub fn register(self: Pin<&Self>, handler: impl Listener<T> + 'static) -> Guard<T> {
         let next = self.head.get();
         let node = Rc::new(Node {
