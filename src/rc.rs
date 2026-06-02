@@ -42,6 +42,7 @@ impl<T> Drop for Registry<T> {
 
 impl<T> Drop for Guard<T> {
     fn drop(&mut self) {
+        // This may read a node already dropped-in-place, but the `meta` field should still be intact.
         let meta = unsafe { *self.node.cast::<DynMetadata<dyn Handler<T>>>() };
         let node = ptr::from_raw_parts::<Node<T, dyn Handler<T>>>(self.node, meta);
         let Some(node) = unsafe { Weak::from_raw(node) }.upgrade() else { return };
@@ -57,7 +58,7 @@ impl<T> Registry<T> {
     }
 
     pub fn broadcast(&self, event: &T) {
-        // TODO: implement.
+        // TODO: implement and correctly handle reentrancy
         todo!()
     }
 }
