@@ -1,0 +1,8 @@
+max_width = 150
+fn_single_line = true
+where_single_line = true
+use_small_heuristics = "Max"
+brace_style = "PreferSameLine"
+fn_params_layout = "Compressed"
+imports_granularity = "Module"
+group_imports = "One"
