@@ -1,7 +1,7 @@
-use alloc::rc::{Rc, Weak};
+use alloc::boxed::Box;
 use core::cell::Cell;
 use core::marker::{PhantomData, PhantomPinned};
-use core::mem::forget;
+use core::mem::ManuallyDrop;
 use core::pin::Pin;
 use core::ptr::{self, DynMetadata, null};
 
@@ -25,26 +25,39 @@ pub struct Guard<T> {
     _p: PhantomData<fn(T)>,
 }
 
+// Flag bits in `state`
+const STRONG: usize = 1;
+const WEAK: usize = 2;
+const RECURSIVE_CANCEL: usize = 4;
+const RECURSIVE_VISIT: usize = 8;
+
 #[repr(C, align(2))]
-struct Node<T, H: Listener<T> + ?Sized> {
+struct Node<T, L: Listener<T> + ?Sized> {
     meta: DynMetadata<dyn Listener<T>>,
     /// If LSB=1, it points back to the registry.
     prev: Cell<*const ()>,
     next: Cell<*const ()>,
-    /// If LSB=1, the node is cancelled while still in its `accept` call.
-    /// Other bits count the depth of recursive `broadcast` calls.
-    recursion: Cell<usize>,
-    handler: H,
+    state: Cell<usize>,
+    listener: ManuallyDrop<L>,
 }
 
 unsafe fn resolve<T>(thin: *const ()) -> *const Node<T, dyn Listener<T>> {
-    // In the `Weak` case this may read a node already dropped-in-place, but the `meta` field should still be intact.
     let meta = unsafe { *thin.cast::<DynMetadata<dyn Listener<T>>>() };
     ptr::from_raw_parts::<Node<T, dyn Listener<T>>>(thin, meta)
 }
 
+unsafe fn decrement_strong<T>(ptr: *mut Node<T, dyn Listener<T>>) {
+    let node = unsafe { &mut *ptr };
+    let state = node.state.get();
+    node.state.set(state & !STRONG);
+    unsafe { ManuallyDrop::drop(&mut node.listener) };
+    if state & WEAK == 0 {
+        drop(unsafe { Box::from_raw(ptr) });
+    }
+}
+
 impl<T> Node<T, dyn Listener<T>> {
-    unsafe fn unlink(self: Rc<Self>) {
+    unsafe fn unlink(&self) {
         let (prev, next) = (self.prev.get(), self.next.get());
         if prev.addr() & 1 == 1 {
             let registry = prev.map_addr(|x| x & !1).cast::<Registry<T>>();
@@ -62,7 +75,9 @@ impl<T> Drop for Registry<T> {
     fn drop(&mut self) {
         let mut thin = self.head.get();
         while !thin.is_null() {
-            thin = unsafe { Rc::from_raw(resolve::<T>(thin)) }.next.get();
+            let ptr = unsafe { resolve::<T>(thin) }.cast_mut();
+            thin = unsafe { *(*ptr).next.get_mut() };
+            unsafe { decrement_strong(ptr) }
         }
     }
 }
@@ -70,14 +85,17 @@ impl<T> Drop for Registry<T> {
 impl<T> Drop for Guard<T> {
     fn drop(&mut self) {
         let ptr = unsafe { resolve::<T>(self.node) };
-        if unsafe { Weak::from_raw(ptr) }.strong_count() > 0 {
-            let node = unsafe { &*ptr };
-            let depth = node.recursion.get();
-            if depth == 0 {
-                unsafe { Rc::from_raw(ptr).unlink() }
-            } else {
-                node.recursion.set(depth | 1);
-            }
+        let node = unsafe { &*ptr };
+        let state = node.state.get();
+        if state & STRONG == 0 {
+            drop(unsafe { Box::from_raw(ptr.cast_mut()) });
+        } else if state & !(RECURSIVE_VISIT - 1) == 0 {
+            let node = unsafe { &mut *ptr.cast_mut() };
+            unsafe { node.unlink() };
+            unsafe { ManuallyDrop::drop(&mut node.listener) };
+            drop(unsafe { Box::from_raw(ptr.cast_mut()) });
+        } else {
+            node.state.set(state & !WEAK | RECURSIVE_CANCEL);
         }
     }
 }
@@ -89,17 +107,16 @@ impl<T> Default for Registry<T> {
 impl<T> Registry<T> {
     pub const fn new() -> Self { Self { head: Cell::new(null()), _p: PhantomData, _pin: PhantomPinned } }
 
-    pub fn register(self: Pin<&Self>, handler: impl Listener<T> + 'static) -> Guard<T> {
+    pub fn register(self: Pin<&Self>, listener: impl Listener<T> + 'static) -> Guard<T> {
         let next = self.head.get();
-        let node = Rc::new(Node {
-            meta: ptr::metadata(&handler as &dyn Listener<T>),
+        let node = Box::new(Node {
+            meta: ptr::metadata(&listener as &dyn Listener<T>),
             prev: (&raw const *self).map_addr(|x| x | 1).cast::<()>().into(),
             next: next.into(),
-            recursion: Cell::new(0),
-            handler,
-        }) as Rc<Node<T, dyn Listener<T>>>;
-        forget(Rc::downgrade(&node));
-        let thin = Rc::into_raw(node).to_raw_parts().0;
+            state: Cell::new(STRONG | WEAK),
+            listener: ManuallyDrop::new(listener),
+        }) as Box<Node<T, dyn Listener<T>>>;
+        let thin = Box::into_raw(node).cast_const().to_raw_parts().0;
         self.head.set(thin);
         if !next.is_null() {
             unsafe { &*resolve::<T>(next) }.prev.set(thin);
@@ -112,20 +129,21 @@ impl<T> Registry<T> {
         while !thin.is_null() {
             let ptr = unsafe { resolve::<T>(thin) };
             let node = unsafe { &*ptr };
-            let mut depth = node.recursion.get();
-            if depth & 1 == 1 {
+            let mut state = node.state.get();
+            if state & RECURSIVE_CANCEL != 0 {
                 // Node already cancelled by an outer `accept` call. Outermost `broadcast` will unlink it.
                 thin = node.next.get();
                 continue;
             }
-            node.recursion.set(depth + 2);
-            node.handler.accept(event);
+            node.state.set(state + RECURSIVE_VISIT);
+            node.listener.accept(event);
             thin = node.next.get();
-            depth = node.recursion.get() - 2;
-            if depth == 1 {
-                unsafe { Rc::from_raw(ptr).unlink() }
+            state = node.state.get() - RECURSIVE_VISIT;
+            if state & !(RECURSIVE_CANCEL - 1) == RECURSIVE_CANCEL {
+                unsafe { node.unlink() };
+                unsafe { decrement_strong(ptr.cast_mut()) };
             } else {
-                node.recursion.set(depth);
+                node.state.set(state);
             }
         }
     }
@@ -235,8 +253,9 @@ mod tests {
         guard.set(Some(reg.register({
             let (state, me) = (state.clone(), guard.clone());
             move |_: &u32| {
-                state.accept_count.update(|x| x + 1);
                 me.set(None);
+                // Access listener state after self-cancel.
+                state.accept_count.update(|x| x + 1);
             }
         })));
         reg.broadcast(&0);
