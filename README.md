@@ -30,5 +30,5 @@ The expected behaviors are listed below.
 
 - The order in which the listeners run is unspecified.
 - This crate requires a nightly compiler (needed for accessing vtable pointers).
-- This crate currently only provides the single-threaded `rc` flavor, built on `Rc`/`Weak`.
-  A thread-safe `Arc`/`Weak` flavor may be added in the future.
+- This crate currently only provides the single-threaded `local` flavor.
+  A thread-safe `shared` flavor may be added in the future.
