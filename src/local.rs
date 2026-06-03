@@ -125,10 +125,10 @@ impl<T> Registry<T> {
     }
 
     pub fn broadcast(&self, event: &T) {
+        let mut deferred_cancels = null::<()>();
         let mut thin = self.head.get();
         while !thin.is_null() {
-            let ptr = unsafe { resolve::<T>(thin) };
-            let node = unsafe { &*ptr };
+            let node = unsafe { &*resolve::<T>(thin) };
             let mut state = node.state.get();
             if state & RECURSIVE_CANCEL != 0 {
                 // Node already cancelled by an outer `accept` call. Outermost `broadcast` will unlink it.
@@ -137,14 +137,21 @@ impl<T> Registry<T> {
             }
             node.state.set(state + RECURSIVE_VISIT);
             node.listener.accept(event);
-            thin = node.next.get();
+            let next = node.next.get();
             state = node.state.get() - RECURSIVE_VISIT;
             if state & !(RECURSIVE_CANCEL - 1) == RECURSIVE_CANCEL {
                 unsafe { node.unlink() };
-                unsafe { decrement_strong(ptr.cast_mut()) };
+                node.next.set(deferred_cancels);
+                deferred_cancels = thin;
             } else {
                 node.state.set(state);
             }
+            thin = next;
+        }
+        while !deferred_cancels.is_null() {
+            let ptr = unsafe { resolve::<T>(deferred_cancels) }.cast_mut();
+            deferred_cancels = unsafe { *(*ptr).next.get_mut() };
+            unsafe { decrement_strong(ptr) };
         }
     }
 }
@@ -276,6 +283,33 @@ mod tests {
         assert_eq!(state.drop_count.get(), 1);
         reg.broadcast(&0);
         assert_eq!(state.accept_count.get(), 0);
+    }
+
+    #[test]
+    fn destructor_cancel_in_flight() {
+        struct Saboteur {
+            me: Rc<Cell<Option<Guard<u32>>>>,
+            victim: Rc<Cell<Option<Guard<u32>>>>,
+        }
+
+        impl Listener<u32> for Saboteur {
+            fn accept(&self, _: &u32) { self.me.set(None); }
+        }
+
+        impl Drop for Saboteur {
+            fn drop(&mut self) { self.victim.set(None); }
+        }
+
+        let reg = pin!(Registry::new());
+        let reg = reg.as_ref();
+        let state = Rc::<State>::default();
+        let a = Rc::new(Cell::new(Some(reg.register(Capturer(state.clone())))));
+        let b = Rc::new(Cell::new(None));
+        b.set(Some(reg.register(Saboteur { me: b.clone(), victim: a.clone() })));
+        reg.broadcast(&7);
+        assert_eq!(state.accept_count.get(), 1);
+        assert_eq!(state.sum.get(), 7);
+        assert_eq!(state.drop_count.get(), 1);
     }
 
     #[test]

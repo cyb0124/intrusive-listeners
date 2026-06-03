@@ -25,6 +25,8 @@ The expected behaviors are listed below.
   Callbacks for the new event will immediately run inside the nested `broadcast` call.
 - **Registering new listeners inside a listener callback**\
   The new listeners will not receive the in-flight event.
+- **Accessing the registry in listener's destructor**\
+  Listener's destructor may freely register, broadcast, or cancel other listeners.
 
 ## Caveats
 
