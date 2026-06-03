@@ -13,6 +13,7 @@ impl<T, F: Fn(&T)> Listener<T> for F {
     fn accept(&self, event: &T) { self(event) }
 }
 
+#[repr(align(2))]
 pub struct Registry<T> {
     head: Cell<*const ()>,
     _p: PhantomData<fn(T)>,
@@ -24,7 +25,7 @@ pub struct Guard<T> {
     _p: PhantomData<fn(T)>,
 }
 
-#[repr(C)]
+#[repr(C, align(2))]
 struct Node<T, H: Listener<T> + ?Sized> {
     meta: DynMetadata<dyn Listener<T>>,
     /// If LSB=1, it points back to the registry.
