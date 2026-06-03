@@ -75,6 +75,12 @@ impl<T> Drop for Registry<T> {
     fn drop(&mut self) {
         let mut thin = self.head.get();
         while !thin.is_null() {
+            let node = unsafe { &mut *resolve::<T>(thin).cast_mut() };
+            *node.state.get_mut() |= RECURSIVE_VISIT;
+            thin = node.next.get();
+        }
+        thin = self.head.get();
+        while !thin.is_null() {
             let ptr = unsafe { resolve::<T>(thin) }.cast_mut();
             thin = unsafe { *(*ptr).next.get_mut() };
             unsafe { decrement_strong(ptr) }
@@ -309,6 +315,34 @@ mod tests {
         reg.broadcast(&7);
         assert_eq!(state.accept_count.get(), 1);
         assert_eq!(state.sum.get(), 7);
+        assert_eq!(state.drop_count.get(), 1);
+    }
+
+    #[test]
+    fn cancel_in_registry_destructor() {
+        struct Saboteur {
+            victim: Rc<Cell<Option<Guard<u32>>>>,
+        }
+
+        impl Listener<u32> for Saboteur {
+            fn accept(&self, _: &u32) {}
+        }
+
+        impl Drop for Saboteur {
+            fn drop(&mut self) { self.victim.set(None); }
+        }
+
+        let state = Rc::<State>::default();
+        let a = Rc::new(Cell::new(None));
+        let b = {
+            let reg = pin!(Registry::new());
+            let reg = reg.as_ref();
+            a.set(Some(reg.register(Capturer(state.clone()))));
+            reg.register(Saboteur { victim: a.clone() })
+        };
+        assert_eq!(state.drop_count.get(), 1);
+        assert!(a.take().is_none());
+        drop(b);
         assert_eq!(state.drop_count.get(), 1);
     }
 
