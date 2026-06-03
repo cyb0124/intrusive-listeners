@@ -26,10 +26,9 @@ pub struct Guard<T> {
 }
 
 // Flag bits in `state`
-const STRONG: usize = 1;
-const WEAK: usize = 2;
-const RECURSIVE_CANCEL: usize = 4;
-const RECURSIVE_VISIT: usize = 8;
+const ALIVE: usize = 1;
+const RECURSIVE_CANCEL: usize = 2;
+const RECURSIVE_VISIT: usize = 4;
 
 #[repr(C, align(2))]
 struct Node<T, L: Listener<T> + ?Sized> {
@@ -44,16 +43,6 @@ struct Node<T, L: Listener<T> + ?Sized> {
 unsafe fn resolve<T>(thin: *const ()) -> *const Node<T, dyn Listener<T>> {
     let meta = unsafe { *thin.cast::<DynMetadata<dyn Listener<T>>>() };
     ptr::from_raw_parts::<Node<T, dyn Listener<T>>>(thin, meta)
-}
-
-unsafe fn decrement_strong<T>(ptr: *mut Node<T, dyn Listener<T>>) {
-    let node = unsafe { &mut *ptr };
-    let state = node.state.get();
-    node.state.set(state & !STRONG);
-    unsafe { ManuallyDrop::drop(&mut node.listener) };
-    if state & WEAK == 0 {
-        drop(unsafe { Box::from_raw(ptr) });
-    }
 }
 
 impl<T> Node<T, dyn Listener<T>> {
@@ -77,13 +66,19 @@ impl<T> Drop for Registry<T> {
         while !thin.is_null() {
             let node = unsafe { &mut *resolve::<T>(thin).cast_mut() };
             *node.state.get_mut() |= RECURSIVE_VISIT;
-            thin = node.next.get();
+            thin = *node.next.get_mut();
         }
         thin = self.head.get();
         while !thin.is_null() {
             let ptr = unsafe { resolve::<T>(thin) }.cast_mut();
             thin = unsafe { *(*ptr).next.get_mut() };
-            unsafe { decrement_strong(ptr) }
+            unsafe { ManuallyDrop::drop(&mut (*ptr).listener) };
+            let state = unsafe { (*ptr).state.get_mut() };
+            if *state & RECURSIVE_CANCEL != 0 {
+                drop(unsafe { Box::from_raw(ptr) });
+            } else {
+                *state &= !ALIVE;
+            }
         }
     }
 }
@@ -91,9 +86,8 @@ impl<T> Drop for Registry<T> {
 impl<T> Drop for Guard<T> {
     fn drop(&mut self) {
         let ptr = unsafe { resolve::<T>(self.node) };
-        let node = unsafe { &*ptr };
-        let state = node.state.get();
-        if state & STRONG == 0 {
+        let state = unsafe { (*ptr).state.get() };
+        if state & ALIVE == 0 {
             drop(unsafe { Box::from_raw(ptr.cast_mut()) });
         } else if state & !(RECURSIVE_VISIT - 1) == 0 {
             let node = unsafe { &mut *ptr.cast_mut() };
@@ -101,7 +95,7 @@ impl<T> Drop for Guard<T> {
             unsafe { ManuallyDrop::drop(&mut node.listener) };
             drop(unsafe { Box::from_raw(ptr.cast_mut()) });
         } else {
-            node.state.set(state & !WEAK | RECURSIVE_CANCEL);
+            unsafe { (*ptr).state.set(state | RECURSIVE_CANCEL) };
         }
     }
 }
@@ -119,7 +113,7 @@ impl<T> Registry<T> {
             meta: ptr::metadata(&listener as &dyn Listener<T>),
             prev: (&raw const *self).map_addr(|x| x | 1).cast::<()>().into(),
             next: next.into(),
-            state: Cell::new(STRONG | WEAK),
+            state: Cell::new(ALIVE),
             listener: ManuallyDrop::new(listener),
         }) as Box<Node<T, dyn Listener<T>>>;
         let thin = Box::into_raw(node).cast_const().to_raw_parts().0;
@@ -156,8 +150,10 @@ impl<T> Registry<T> {
         }
         while !deferred_cancels.is_null() {
             let ptr = unsafe { resolve::<T>(deferred_cancels) }.cast_mut();
-            deferred_cancels = unsafe { *(*ptr).next.get_mut() };
-            unsafe { decrement_strong(ptr) };
+            let node = unsafe { &mut *ptr };
+            deferred_cancels = *node.next.get_mut();
+            unsafe { ManuallyDrop::drop(&mut node.listener) };
+            drop(unsafe { Box::from_raw(ptr) });
         }
     }
 }
@@ -319,7 +315,7 @@ mod tests {
     }
 
     #[test]
-    fn cancel_in_registry_destructor() {
+    fn cancel_other_in_registry_destructor() {
         struct Saboteur {
             victim: Rc<Cell<Option<Guard<u32>>>>,
         }
@@ -344,6 +340,36 @@ mod tests {
         assert!(a.take().is_none());
         drop(b);
         assert_eq!(state.drop_count.get(), 1);
+    }
+
+    #[test]
+    fn cancel_self_in_registry_destructor() {
+        struct SelfCanceller {
+            me: Rc<Cell<Option<Guard<u32>>>>,
+            state: Rc<State>,
+        }
+
+        impl Listener<u32> for SelfCanceller {
+            fn accept(&self, _: &u32) {}
+        }
+
+        impl Drop for SelfCanceller {
+            fn drop(&mut self) {
+                self.me.set(None);
+                // Access listener state after self-cancel.
+                self.state.drop_count.update(|x| x + 1);
+            }
+        }
+
+        let state = Rc::<State>::default();
+        let me = Rc::new(Cell::new(None));
+        {
+            let reg = pin!(Registry::new());
+            let reg = reg.as_ref();
+            me.set(Some(reg.register(SelfCanceller { me: me.clone(), state: state.clone() })));
+        }
+        assert_eq!(state.drop_count.get(), 1);
+        assert!(me.take().is_none());
     }
 
     #[test]
