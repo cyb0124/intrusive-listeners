@@ -1,12 +1,16 @@
 [package]
 name = "intrusive-listeners"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 authors = ["Yibo Cao <cyb@ieee.org>"]
-description = "A compact type-erased event-listener registry"
+description = "A compact reentrant type-erased event-listener registry"
 license = "MIT"
 repository = "https://github.com/cyb0124/intrusive-listeners"
 keywords = ["intrusive", "listener", "event", "observer", "no_std"]
 categories = ["data-structures", "no-std", "rust-patterns"]
 
+[features]
+default = ["lock_api"]
+
 [dependencies]
+lock_api = { version = "0.4", default-features = false, optional = true }

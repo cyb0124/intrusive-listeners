@@ -1,17 +1,10 @@
+use crate::{ALIVE, Listener, RECURSIVE_CANCEL, RECURSIVE_VISIT};
 use alloc::boxed::Box;
 use core::cell::Cell;
 use core::marker::{PhantomData, PhantomPinned};
 use core::mem::ManuallyDrop;
 use core::pin::Pin;
 use core::ptr::{self, DynMetadata, null};
-
-pub trait Listener<T> {
-    fn accept(&self, event: &T);
-}
-
-impl<T, F: Fn(&T)> Listener<T> for F {
-    fn accept(&self, event: &T) { self(event) }
-}
 
 #[repr(align(2))]
 pub struct Registry<T> {
@@ -24,11 +17,6 @@ pub struct Guard<T> {
     node: *const (),
     _p: PhantomData<fn(T)>,
 }
-
-// Flag bits in `state`
-const ALIVE: usize = 1;
-const RECURSIVE_CANCEL: usize = 2;
-const RECURSIVE_VISIT: usize = 4;
 
 #[repr(C, align(2))]
 struct Node<T, L: Listener<T> + ?Sized> {
@@ -84,6 +72,7 @@ impl<T> Drop for Registry<T> {
 }
 
 impl<T> Drop for Guard<T> {
+    /// May overlap listener destructor.
     fn drop(&mut self) {
         let ptr = unsafe { resolve::<T>(self.node) };
         let state = unsafe { (*ptr).state.get() };
@@ -162,7 +151,8 @@ impl<T> Registry<T> {
 mod tests {
     extern crate std;
 
-    use super::{Listener, Registry};
+    use super::{Guard, Registry};
+    use crate::Listener;
     use alloc::rc::Rc;
     use core::array;
     use core::cell::{Cell, OnceCell};
