@@ -13,6 +13,7 @@ pub struct Registry<T> {
     _pin: PhantomPinned,
 }
 
+#[must_use]
 pub struct Guard<T> {
     node: *const (),
     _p: PhantomData<fn(T)>,

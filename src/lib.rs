@@ -57,5 +57,5 @@ pub mod local;
 pub mod locked;
 
 // Run tests using:
-// - cargo miri test
-// - MIRIFLAGS=-Zmiri-tree-borrows cargo miri test
+// - MIRIFLAGS=-Zmiri-many-seeds cargo miri test
+// - MIRIFLAGS="-Zmiri-tree-borrows -Zmiri-many-seeds" cargo miri test

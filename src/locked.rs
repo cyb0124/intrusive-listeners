@@ -10,6 +10,7 @@ pub struct Registry<T, R: RawMutex> {
     inner: *const Inner<T, R>,
 }
 
+#[must_use]
 pub struct Guard<T, R: RawMutex> {
     node: *const (),
     _p: PhantomData<Inner<T, R>>,
@@ -194,5 +195,306 @@ impl<T, R: RawMutex> Registry<T, R> {
             unsafe { ManuallyDrop::drop(&mut node.listener) };
             drop(unsafe { Box::from_raw(ptr) });
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    extern crate std;
+
+    use super::{Guard, Registry};
+    use crate::Listener;
+    use alloc::sync::Arc;
+    use core::array;
+    use core::sync::atomic::Ordering::{Acquire, Relaxed, Release};
+    use core::sync::atomic::{AtomicBool, AtomicU32};
+    use lock_api::{GuardSend, Mutex, RawMutex};
+    use std::sync::OnceLock;
+    use std::thread;
+
+    struct TestLock<const SPIN: bool>(AtomicBool);
+
+    unsafe impl<const SPIN: bool> RawMutex for TestLock<SPIN> {
+        const INIT: Self = Self(AtomicBool::new(false));
+        type GuardMarker = GuardSend;
+
+        fn lock(&self) {
+            while !self.try_lock() {
+                assert!(SPIN);
+                core::hint::spin_loop();
+            }
+        }
+
+        fn try_lock(&self) -> bool { !self.0.swap(true, Acquire) }
+        unsafe fn unlock(&self) { self.0.store(false, Release); }
+    }
+
+    type NoSpinReg = Registry<u32, TestLock<false>>;
+    type SpinReg = Registry<u32, TestLock<true>>;
+    type GuardSlot = Mutex<TestLock<false>, Option<Guard<u32, TestLock<false>>>>;
+
+    #[derive(Default)]
+    struct State {
+        accept_count: AtomicU32,
+        drop_count: AtomicU32,
+        sum: AtomicU32,
+    }
+
+    struct Capturer(Arc<State>);
+
+    impl Listener<u32> for Capturer {
+        fn accept(&self, event: &u32) {
+            self.0.accept_count.fetch_add(1, Relaxed);
+            self.0.sum.fetch_add(*event, Relaxed);
+        }
+    }
+
+    impl Drop for Capturer {
+        fn drop(&mut self) { self.0.drop_count.fetch_add(1, Relaxed); }
+    }
+
+    #[test]
+    fn normal_path() {
+        let reg = NoSpinReg::new();
+        let states = <[Arc<State>; 3]>::default();
+        let _guards = states.each_ref().map(|x| reg.register(Capturer(x.clone())));
+        reg.broadcast(&3);
+        reg.broadcast(&4);
+        assert_eq!(states.each_ref().map(|x| x.accept_count.load(Relaxed)), [2, 2, 2]);
+        assert_eq!(states.each_ref().map(|x| x.sum.load(Relaxed)), [7, 7, 7]);
+    }
+
+    #[test]
+    fn registry_dropped_early() {
+        let state = Arc::<State>::default();
+        let _guards: [_; 2];
+        {
+            let reg = NoSpinReg::new();
+            _guards = array::from_fn(|_| reg.register(Capturer(state.clone())));
+        }
+        assert_eq!(state.drop_count.load(Relaxed), 2);
+    }
+
+    #[test]
+    fn registry_dropped_late() {
+        let state = Arc::<State>::default();
+        let reg = NoSpinReg::new();
+        let guards: [_; 3] = array::from_fn(|_| reg.register(Capturer(state.clone())));
+        drop(guards);
+        assert_eq!(state.drop_count.load(Relaxed), 3);
+    }
+
+    #[test]
+    fn cancel_internal() {
+        let state = Arc::<State>::default();
+        let reg = NoSpinReg::new();
+        let [_a, b, _c] = array::from_fn(|_| reg.register(Capturer(state.clone())));
+        drop(b);
+        assert_eq!(state.drop_count.load(Relaxed), 1);
+        reg.broadcast(&5);
+        assert_eq!(state.sum.load(Relaxed), 10);
+    }
+
+    #[test]
+    fn register_inside_callback() {
+        let reg = Arc::<NoSpinReg>::default();
+        let state = Arc::<State>::default();
+        let _g = reg.register({
+            let (reg, state, capturer) = (Arc::downgrade(&reg), state.clone(), OnceLock::new());
+            move |_: &u32| {
+                capturer.get_or_init(|| {
+                    let reg = reg.upgrade().unwrap();
+                    reg.register(Capturer(state.clone()))
+                });
+            }
+        });
+        reg.broadcast(&0);
+        assert_eq!(state.accept_count.load(Relaxed), 0);
+        reg.broadcast(&0);
+        assert_eq!(state.accept_count.load(Relaxed), 1);
+    }
+
+    #[test]
+    fn self_cancel() {
+        let reg = NoSpinReg::new();
+        let state = Arc::<State>::default();
+        let guard = Arc::<GuardSlot>::default();
+        *guard.lock() = Some(reg.register({
+            let (state, me) = (state.clone(), guard.clone());
+            move |_: &u32| {
+                *me.lock() = None;
+                // Access listener state after self-cancel.
+                state.accept_count.fetch_add(1, Relaxed);
+            }
+        }));
+        reg.broadcast(&0);
+        assert_eq!(state.accept_count.load(Relaxed), 1);
+        reg.broadcast(&0);
+        assert_eq!(state.accept_count.load(Relaxed), 1);
+    }
+
+    #[test]
+    fn cancel_in_flight() {
+        let reg = NoSpinReg::new();
+        let state = Arc::<State>::default();
+        let victim = GuardSlot::new(Some(reg.register(Capturer(state.clone()))));
+        let _g = reg.register(move |_: &u32| *victim.lock() = None);
+        reg.broadcast(&0);
+        assert_eq!(state.accept_count.load(Relaxed), 0);
+        assert_eq!(state.drop_count.load(Relaxed), 1);
+        reg.broadcast(&0);
+        assert_eq!(state.accept_count.load(Relaxed), 0);
+    }
+
+    #[test]
+    fn destructor_cancel_in_flight() {
+        struct Saboteur {
+            me: Arc<GuardSlot>,
+            victim: Arc<GuardSlot>,
+        }
+
+        impl Listener<u32> for Saboteur {
+            fn accept(&self, _: &u32) { *self.me.lock() = None; }
+        }
+
+        impl Drop for Saboteur {
+            fn drop(&mut self) { *self.victim.lock() = None; }
+        }
+
+        let reg: NoSpinReg = Registry::new();
+        let state = Arc::<State>::default();
+        let a = Arc::new(GuardSlot::new(Some(reg.register(Capturer(state.clone())))));
+        let b = Arc::<GuardSlot>::default();
+        *b.lock() = Some(reg.register(Saboteur { me: b.clone(), victim: a.clone() }));
+        reg.broadcast(&7);
+        assert_eq!(state.accept_count.load(Relaxed), 1);
+        assert_eq!(state.sum.load(Relaxed), 7);
+        assert_eq!(state.drop_count.load(Relaxed), 1);
+    }
+
+    #[test]
+    fn cancel_other_in_registry_destructor() {
+        struct Saboteur {
+            victim: Arc<GuardSlot>,
+        }
+
+        impl Listener<u32> for Saboteur {
+            fn accept(&self, _: &u32) {}
+        }
+
+        impl Drop for Saboteur {
+            fn drop(&mut self) { *self.victim.lock() = None; }
+        }
+
+        let state = Arc::<State>::default();
+        let a = Arc::<GuardSlot>::default();
+        let b = {
+            let reg = NoSpinReg::new();
+            *a.lock() = Some(reg.register(Capturer(state.clone())));
+            reg.register(Saboteur { victim: a.clone() })
+        };
+        assert_eq!(state.drop_count.load(Relaxed), 1);
+        assert!(a.lock().is_none());
+        drop(b);
+        assert_eq!(state.drop_count.load(Relaxed), 1);
+    }
+
+    #[test]
+    fn cancel_self_in_registry_destructor() {
+        struct SelfCanceller {
+            me: Arc<GuardSlot>,
+            state: Arc<State>,
+        }
+
+        impl Listener<u32> for SelfCanceller {
+            fn accept(&self, _: &u32) {}
+        }
+
+        impl Drop for SelfCanceller {
+            fn drop(&mut self) {
+                *self.me.lock() = None;
+                // Access listener state after self-cancel.
+                self.state.drop_count.fetch_add(1, Relaxed);
+            }
+        }
+
+        let state = Arc::<State>::default();
+        let me = Arc::<GuardSlot>::default();
+        {
+            let reg = NoSpinReg::new();
+            *me.lock() = Some(reg.register(SelfCanceller { me: me.clone(), state: state.clone() }));
+        }
+        assert_eq!(state.drop_count.load(Relaxed), 1);
+        assert!(me.lock().is_none());
+    }
+
+    #[test]
+    fn nested_broadcast_is_safe() {
+        let reg = Arc::<NoSpinReg>::default();
+        let state = Arc::<State>::default();
+        let _g = reg.register({
+            let (reg, state, depth) = (Arc::downgrade(&reg), state.clone(), AtomicU32::new(0));
+            move |event: &u32| {
+                state.accept_count.fetch_add(1, Relaxed);
+                if depth.fetch_add(1, Relaxed) < 2 {
+                    reg.upgrade().unwrap().broadcast(event);
+                }
+            }
+        });
+        reg.broadcast(&0);
+        assert_eq!(state.accept_count.load(Relaxed), 3);
+    }
+
+    #[test]
+    fn concurrent_broadcast() {
+        let reg = Arc::<SpinReg>::default();
+        let state = Arc::<State>::default();
+        let _guards: [_; 4] = array::from_fn(|_| reg.register(Capturer(state.clone())));
+        thread::scope(|scope| {
+            for _ in 0..8 {
+                let reg = reg.clone();
+                scope.spawn(move || reg.broadcast(&1));
+            }
+        });
+        assert_eq!(state.accept_count.load(Relaxed), 32);
+        assert_eq!(state.sum.load(Relaxed), 32);
+    }
+
+    #[test]
+    fn concurrent_register_cancel_broadcast() {
+        let reg = Arc::<SpinReg>::default();
+        let state = Arc::<State>::default();
+        thread::scope(|scope| {
+            for _ in 0..5 {
+                let reg = reg.clone();
+                scope.spawn(move || {
+                    for _ in 0..5 {
+                        reg.broadcast(&1);
+                    }
+                });
+            }
+            for _ in 0..5 {
+                let (reg, state) = (reg.clone(), state.clone());
+                scope.spawn(move || {
+                    for _ in 0..5 {
+                        let guard = reg.register(Capturer(state.clone()));
+                        scope.spawn(move || drop(guard));
+                    }
+                });
+            }
+        });
+        assert_eq!(state.drop_count.load(Relaxed), 25);
+    }
+
+    #[test]
+    fn concurrent_registry_guard_drop() {
+        let state = Arc::<State>::default();
+        let reg = SpinReg::new();
+        let guards: [_; 16] = array::from_fn(|_| reg.register(Capturer(state.clone())));
+        thread::scope(|s| {
+            s.spawn(move || drop(reg));
+            s.spawn(move || drop(guards));
+        });
+        assert_eq!(state.drop_count.load(Relaxed), 16);
     }
 }
