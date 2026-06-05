@@ -147,7 +147,7 @@ impl<T, R: RawMutex> Registry<T, R> {
         let inner = unsafe { &*self.inner };
         inner.lock.lock();
         let next = inner.head.get();
-        *node.prev.get_mut() = next;
+        *node.next.get_mut() = next;
         let thin = Box::into_raw(node).cast_const().to_raw_parts().0;
         inner.head.set(thin);
         if !next.is_null() {
