@@ -1,4 +1,4 @@
-use crate::{ALIVE, Listener, RECURSIVE_CANCEL, RECURSIVE_VISIT};
+use crate::{ALIVE, EventFamily, Listener, RECURSIVE_CANCEL, RECURSIVE_VISIT};
 use alloc::boxed::Box;
 use core::cell::Cell;
 use core::marker::{PhantomData, PhantomPinned};
@@ -7,20 +7,20 @@ use core::pin::Pin;
 use core::ptr::{self, DynMetadata, null};
 
 #[repr(align(2))]
-pub struct Registry<T> {
+pub struct Registry<T: EventFamily> {
     head: Cell<*const ()>,
-    _p: PhantomData<fn(T)>,
+    _p: PhantomData<fn(T) -> T>,
     _pin: PhantomPinned,
 }
 
 #[must_use]
-pub struct Guard<T> {
+pub struct Guard<T: EventFamily> {
     node: *const (),
-    _p: PhantomData<fn(T)>,
+    _p: PhantomData<fn(T) -> T>,
 }
 
 #[repr(C, align(2))]
-struct Node<T, L: Listener<T> + ?Sized> {
+struct Node<T: EventFamily, L: Listener<T> + ?Sized> {
     meta: DynMetadata<dyn Listener<T>>,
     /// If LSB=1, it points back to the registry.
     prev: Cell<*const ()>,
@@ -29,12 +29,12 @@ struct Node<T, L: Listener<T> + ?Sized> {
     listener: ManuallyDrop<L>,
 }
 
-unsafe fn resolve<T>(thin: *const ()) -> *const Node<T, dyn Listener<T>> {
+unsafe fn resolve<T: EventFamily>(thin: *const ()) -> *const Node<T, dyn Listener<T>> {
     let meta = unsafe { *thin.cast::<DynMetadata<dyn Listener<T>>>() };
     ptr::from_raw_parts::<Node<T, dyn Listener<T>>>(thin, meta)
 }
 
-impl<T> Node<T, dyn Listener<T>> {
+impl<T: EventFamily> Node<T, dyn Listener<T>> {
     unsafe fn unlink(&self) {
         let (prev, next) = (self.prev.get(), self.next.get());
         if prev.addr() & 1 == 1 {
@@ -49,7 +49,7 @@ impl<T> Node<T, dyn Listener<T>> {
     }
 }
 
-impl<T> Drop for Registry<T> {
+impl<T: EventFamily> Drop for Registry<T> {
     fn drop(&mut self) {
         let mut thin = self.head.get();
         while !thin.is_null() {
@@ -72,7 +72,7 @@ impl<T> Drop for Registry<T> {
     }
 }
 
-impl<T> Drop for Guard<T> {
+impl<T: EventFamily> Drop for Guard<T> {
     /// May overlap listener destructor.
     fn drop(&mut self) {
         let ptr = unsafe { resolve::<T>(self.node) };
@@ -90,11 +90,11 @@ impl<T> Drop for Guard<T> {
     }
 }
 
-impl<T> Default for Registry<T> {
+impl<T: EventFamily> Default for Registry<T> {
     fn default() -> Self { Self::new() }
 }
 
-impl<T> Registry<T> {
+impl<T: EventFamily> Registry<T> {
     pub const fn new() -> Self { Self { head: Cell::new(null()), _p: PhantomData, _pin: PhantomPinned } }
 
     pub fn register(self: Pin<&Self>, listener: impl Listener<T> + 'static) -> Guard<T> {
@@ -114,7 +114,7 @@ impl<T> Registry<T> {
         Guard { node: thin, _p: PhantomData }
     }
 
-    pub fn broadcast(&self, event: &T) {
+    pub fn broadcast(&self, event: T::Event<'_>) {
         let mut deferred_cancels = null::<()>();
         let mut thin = self.head.get();
         while !thin.is_null() {
@@ -126,7 +126,7 @@ impl<T> Registry<T> {
                 continue;
             }
             node.state.set(state + RECURSIVE_VISIT);
-            node.listener.accept(event);
+            node.listener.accept(event.clone());
             let next = node.next.get();
             state = node.state.get() - RECURSIVE_VISIT;
             if state & !(RECURSIVE_CANCEL - 1) == RECURSIVE_CANCEL {
@@ -153,7 +153,7 @@ mod tests {
     extern crate std;
 
     use super::{Guard, Registry};
-    use crate::Listener;
+    use crate::{ByVal, Listener};
     use alloc::rc::Rc;
     use core::array;
     use core::cell::{Cell, OnceCell};
@@ -168,8 +168,8 @@ mod tests {
 
     struct Capturer(Rc<State>);
 
-    impl Listener<u32> for Capturer {
-        fn accept(&self, event: &u32) {
+    impl Listener<ByVal<u32>> for Capturer {
+        fn accept(&self, event: u32) {
             self.0.accept_count.update(|x| x + 1);
             self.0.sum.update(|x| x + event);
         }
@@ -185,8 +185,8 @@ mod tests {
         let reg = reg.as_ref();
         let states = <[Rc<State>; 3]>::default();
         let _guards = states.each_ref().map(|x| reg.register(Capturer(x.clone())));
-        reg.broadcast(&3);
-        reg.broadcast(&4);
+        reg.broadcast(3);
+        reg.broadcast(4);
         assert_eq!(states.each_ref().map(|x| x.accept_count.get()), [2, 2, 2]);
         assert_eq!(states.each_ref().map(|x| x.sum.get()), [7, 7, 7]);
     }
@@ -221,46 +221,46 @@ mod tests {
         let [_a, b, _c] = array::from_fn(|_| reg.register(Capturer(state.clone())));
         drop(b);
         assert_eq!(state.drop_count.get(), 1);
-        reg.broadcast(&5);
+        reg.broadcast(5);
         assert_eq!(state.sum.get(), 10);
     }
 
     #[test]
     fn register_inside_callback() {
-        let reg = Rc::<Registry<u32>>::default();
+        let reg = Rc::<Registry<ByVal<u32>>>::default();
         let state = Rc::<State>::default();
         let _g = unsafe { Pin::new_unchecked(&*reg) }.register({
             let (reg, state, capturer) = (Rc::downgrade(&reg), state.clone(), OnceCell::new());
-            move |_: &u32| {
+            move |_| {
                 capturer.get_or_init(|| {
                     let reg = reg.upgrade().unwrap();
                     unsafe { Pin::new_unchecked(&*reg) }.register(Capturer(state.clone()))
                 });
             }
         });
-        reg.broadcast(&0);
+        reg.broadcast(0);
         assert_eq!(state.accept_count.get(), 0);
-        reg.broadcast(&0);
+        reg.broadcast(0);
         assert_eq!(state.accept_count.get(), 1);
     }
 
     #[test]
     fn self_cancel() {
-        let reg = pin!(Registry::new());
+        let reg = pin!(Registry::<ByVal<u32>>::new());
         let reg = reg.as_ref();
         let state = Rc::<State>::default();
         let guard = Rc::new(Cell::new(None));
         guard.set(Some(reg.register({
             let (state, me) = (state.clone(), guard.clone());
-            move |_: &u32| {
+            move |_| {
                 me.set(None);
                 // Access listener state after self-cancel.
                 state.accept_count.update(|x| x + 1);
             }
         })));
-        reg.broadcast(&0);
+        reg.broadcast(0);
         assert_eq!(state.accept_count.get(), 1);
-        reg.broadcast(&0);
+        reg.broadcast(0);
         assert_eq!(state.accept_count.get(), 1);
     }
 
@@ -270,23 +270,23 @@ mod tests {
         let reg = reg.as_ref();
         let state = Rc::<State>::default();
         let victim = Cell::new(Some(reg.register(Capturer(state.clone()))));
-        let _g = reg.register(move |_: &u32| victim.set(None));
-        reg.broadcast(&0);
+        let _g = reg.register(move |_| victim.set(None));
+        reg.broadcast(0);
         assert_eq!(state.accept_count.get(), 0);
         assert_eq!(state.drop_count.get(), 1);
-        reg.broadcast(&0);
+        reg.broadcast(0);
         assert_eq!(state.accept_count.get(), 0);
     }
 
     #[test]
     fn destructor_cancel_in_flight() {
         struct Saboteur {
-            me: Rc<Cell<Option<Guard<u32>>>>,
-            victim: Rc<Cell<Option<Guard<u32>>>>,
+            me: Rc<Cell<Option<Guard<ByVal<u32>>>>>,
+            victim: Rc<Cell<Option<Guard<ByVal<u32>>>>>,
         }
 
-        impl Listener<u32> for Saboteur {
-            fn accept(&self, _: &u32) { self.me.set(None); }
+        impl Listener<ByVal<u32>> for Saboteur {
+            fn accept(&self, _: u32) { self.me.set(None); }
         }
 
         impl Drop for Saboteur {
@@ -299,7 +299,7 @@ mod tests {
         let a = Rc::new(Cell::new(Some(reg.register(Capturer(state.clone())))));
         let b = Rc::new(Cell::new(None));
         b.set(Some(reg.register(Saboteur { me: b.clone(), victim: a.clone() })));
-        reg.broadcast(&7);
+        reg.broadcast(7);
         assert_eq!(state.accept_count.get(), 1);
         assert_eq!(state.sum.get(), 7);
         assert_eq!(state.drop_count.get(), 1);
@@ -308,11 +308,11 @@ mod tests {
     #[test]
     fn cancel_other_in_registry_destructor() {
         struct Saboteur {
-            victim: Rc<Cell<Option<Guard<u32>>>>,
+            victim: Rc<Cell<Option<Guard<ByVal<u32>>>>>,
         }
 
-        impl Listener<u32> for Saboteur {
-            fn accept(&self, _: &u32) {}
+        impl Listener<ByVal<u32>> for Saboteur {
+            fn accept(&self, _: u32) {}
         }
 
         impl Drop for Saboteur {
@@ -336,12 +336,12 @@ mod tests {
     #[test]
     fn cancel_self_in_registry_destructor() {
         struct SelfCanceller {
-            me: Rc<Cell<Option<Guard<u32>>>>,
+            me: Rc<Cell<Option<Guard<ByVal<u32>>>>>,
             state: Rc<State>,
         }
 
-        impl Listener<u32> for SelfCanceller {
-            fn accept(&self, _: &u32) {}
+        impl Listener<ByVal<u32>> for SelfCanceller {
+            fn accept(&self, _: u32) {}
         }
 
         impl Drop for SelfCanceller {
@@ -365,18 +365,18 @@ mod tests {
 
     #[test]
     fn nested_broadcast_is_safe() {
-        let reg = Rc::<Registry<u32>>::default();
+        let reg = Rc::<Registry<ByVal<u32>>>::default();
         let state = Rc::<State>::default();
         let _g = unsafe { Pin::new_unchecked(&*reg) }.register({
             let (reg, state, depth) = (Rc::downgrade(&reg), state.clone(), Cell::new(0u32));
-            move |event: &u32| {
+            move |event| {
                 state.accept_count.update(|x| x + 1);
                 if depth.replace(depth.get() + 1) < 2 {
                     reg.upgrade().unwrap().broadcast(event);
                 }
             }
         });
-        reg.broadcast(&0);
+        reg.broadcast(0);
         assert_eq!(state.accept_count.get(), 3);
     }
 }

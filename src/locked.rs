@@ -1,4 +1,4 @@
-use crate::{ALIVE, Listener, RECURSIVE_CANCEL, RECURSIVE_VISIT};
+use crate::{ALIVE, EventFamily, Listener, RECURSIVE_CANCEL, RECURSIVE_VISIT};
 use alloc::boxed::Box;
 use core::cell::Cell;
 use core::marker::PhantomData;
@@ -6,30 +6,30 @@ use core::mem::ManuallyDrop;
 use core::ptr::{self, DynMetadata, null};
 use lock_api::RawMutex;
 
-pub struct Registry<T, R: RawMutex> {
+pub struct Registry<T: EventFamily, R: RawMutex> {
     inner: *const Inner<T, R>,
 }
 
 #[must_use]
-pub struct Guard<T, R: RawMutex> {
+pub struct Guard<T: EventFamily, R: RawMutex> {
     node: *const (),
     _p: PhantomData<Inner<T, R>>,
 }
 
-struct Inner<T, R: RawMutex> {
+struct Inner<T: EventFamily, R: RawMutex> {
     lock: R,
     ref_count: Cell<usize>,
     head: Cell<*const ()>,
-    _p: PhantomData<fn(T)>,
+    _p: PhantomData<fn(T) -> T>,
 }
 
-unsafe impl<T, R: RawMutex + Send + Sync> Send for Registry<T, R> {}
-unsafe impl<T, R: RawMutex + Send + Sync> Sync for Registry<T, R> {}
-unsafe impl<T, R: RawMutex + Send + Sync> Send for Guard<T, R> {}
-unsafe impl<T, R: RawMutex> Sync for Guard<T, R> {}
+unsafe impl<T: EventFamily, R: RawMutex + Send + Sync> Send for Registry<T, R> {}
+unsafe impl<T: EventFamily, R: RawMutex + Send + Sync> Sync for Registry<T, R> {}
+unsafe impl<T: EventFamily, R: RawMutex + Send + Sync> Send for Guard<T, R> {}
+unsafe impl<T: EventFamily, R: RawMutex> Sync for Guard<T, R> {}
 
 #[repr(C)]
-struct Node<T, R: RawMutex, L: Listener<T> + ?Sized> {
+struct Node<T: EventFamily, R: RawMutex, L: Listener<T> + ?Sized> {
     meta: DynMetadata<dyn Listener<T>>,
     parent: *const Inner<T, R>,
     prev: Cell<*const ()>,
@@ -38,12 +38,12 @@ struct Node<T, R: RawMutex, L: Listener<T> + ?Sized> {
     listener: ManuallyDrop<L>,
 }
 
-unsafe fn resolve<T, R: RawMutex>(thin: *const ()) -> *const Node<T, R, dyn Listener<T>> {
+unsafe fn resolve<T: EventFamily, R: RawMutex>(thin: *const ()) -> *const Node<T, R, dyn Listener<T>> {
     let meta = unsafe { *thin.cast::<DynMetadata<dyn Listener<T>>>() };
     ptr::from_raw_parts::<Node<T, R, dyn Listener<T>>>(thin, meta)
 }
 
-impl<T, R: RawMutex> Node<T, R, dyn Listener<T>> {
+impl<T: EventFamily, R: RawMutex> Node<T, R, dyn Listener<T>> {
     unsafe fn unlink(&self, parent: &Inner<T, R>) {
         let (prev, next) = (self.prev.get(), self.next.get());
         if prev.is_null() {
@@ -57,7 +57,7 @@ impl<T, R: RawMutex> Node<T, R, dyn Listener<T>> {
     }
 }
 
-impl<T, R: RawMutex> Drop for Registry<T, R> {
+impl<T: EventFamily, R: RawMutex> Drop for Registry<T, R> {
     fn drop(&mut self) {
         let inner = unsafe { &*self.inner };
         inner.lock.lock();
@@ -92,7 +92,7 @@ impl<T, R: RawMutex> Drop for Registry<T, R> {
     }
 }
 
-impl<T, R: RawMutex> Drop for Guard<T, R> {
+impl<T: EventFamily, R: RawMutex> Drop for Guard<T, R> {
     /// May overlap listener destructor.
     fn drop(&mut self) {
         let ptr = unsafe { resolve::<T, R>(self.node) };
@@ -127,11 +127,11 @@ impl<T, R: RawMutex> Drop for Guard<T, R> {
     }
 }
 
-impl<T, R: RawMutex> Default for Registry<T, R> {
+impl<T: EventFamily, R: RawMutex> Default for Registry<T, R> {
     fn default() -> Self { Self::new() }
 }
 
-impl<T, R: RawMutex> Registry<T, R> {
+impl<T: EventFamily, R: RawMutex> Registry<T, R> {
     pub fn new() -> Self {
         Self { inner: Box::into_raw(Box::new(Inner { lock: R::INIT, head: Cell::new(null()), ref_count: Cell::new(1), _p: PhantomData })) }
     }
@@ -159,7 +159,7 @@ impl<T, R: RawMutex> Registry<T, R> {
         Guard { node: thin, _p: PhantomData }
     }
 
-    pub fn broadcast(&self, event: &T) {
+    pub fn broadcast(&self, event: T::Event<'_>) {
         let inner = unsafe { &*self.inner };
         inner.lock.lock();
         let mut deferred_cancels = null::<()>();
@@ -174,7 +174,7 @@ impl<T, R: RawMutex> Registry<T, R> {
             }
             node.state.set(state + RECURSIVE_VISIT);
             unsafe { inner.lock.unlock() };
-            node.listener.accept(event);
+            node.listener.accept(event.clone());
             inner.lock.lock();
             let next = node.next.get();
             state = node.state.get() - RECURSIVE_VISIT;
@@ -203,7 +203,7 @@ mod tests {
     extern crate std;
 
     use super::{Guard, Registry};
-    use crate::Listener;
+    use crate::{ByVal, Listener};
     use alloc::sync::Arc;
     use core::array;
     use core::sync::atomic::Ordering::{Acquire, Relaxed, Release};
@@ -229,9 +229,9 @@ mod tests {
         unsafe fn unlock(&self) { self.0.store(false, Release); }
     }
 
-    type NoSpinReg = Registry<u32, TestLock<false>>;
-    type SpinReg = Registry<u32, TestLock<true>>;
-    type GuardSlot = Mutex<TestLock<false>, Option<Guard<u32, TestLock<false>>>>;
+    type NoSpinReg = Registry<ByVal<u32>, TestLock<false>>;
+    type SpinReg = Registry<ByVal<u32>, TestLock<true>>;
+    type GuardSlot = Mutex<TestLock<false>, Option<Guard<ByVal<u32>, TestLock<false>>>>;
 
     #[derive(Default)]
     struct State {
@@ -242,10 +242,10 @@ mod tests {
 
     struct Capturer(Arc<State>);
 
-    impl Listener<u32> for Capturer {
-        fn accept(&self, event: &u32) {
+    impl Listener<ByVal<u32>> for Capturer {
+        fn accept(&self, event: u32) {
             self.0.accept_count.fetch_add(1, Relaxed);
-            self.0.sum.fetch_add(*event, Relaxed);
+            self.0.sum.fetch_add(event, Relaxed);
         }
     }
 
@@ -258,8 +258,8 @@ mod tests {
         let reg = NoSpinReg::new();
         let states = <[Arc<State>; 3]>::default();
         let _guards = states.each_ref().map(|x| reg.register(Capturer(x.clone())));
-        reg.broadcast(&3);
-        reg.broadcast(&4);
+        reg.broadcast(3);
+        reg.broadcast(4);
         assert_eq!(states.each_ref().map(|x| x.accept_count.load(Relaxed)), [2, 2, 2]);
         assert_eq!(states.each_ref().map(|x| x.sum.load(Relaxed)), [7, 7, 7]);
     }
@@ -291,7 +291,7 @@ mod tests {
         let [_a, b, _c] = array::from_fn(|_| reg.register(Capturer(state.clone())));
         drop(b);
         assert_eq!(state.drop_count.load(Relaxed), 1);
-        reg.broadcast(&5);
+        reg.broadcast(5);
         assert_eq!(state.sum.load(Relaxed), 10);
     }
 
@@ -301,16 +301,16 @@ mod tests {
         let state = Arc::<State>::default();
         let _g = reg.register({
             let (reg, state, capturer) = (Arc::downgrade(&reg), state.clone(), OnceLock::new());
-            move |_: &u32| {
+            move |_: u32| {
                 capturer.get_or_init(|| {
                     let reg = reg.upgrade().unwrap();
                     reg.register(Capturer(state.clone()))
                 });
             }
         });
-        reg.broadcast(&0);
+        reg.broadcast(0);
         assert_eq!(state.accept_count.load(Relaxed), 0);
-        reg.broadcast(&0);
+        reg.broadcast(0);
         assert_eq!(state.accept_count.load(Relaxed), 1);
     }
 
@@ -321,15 +321,15 @@ mod tests {
         let guard = Arc::<GuardSlot>::default();
         *guard.lock() = Some(reg.register({
             let (state, me) = (state.clone(), guard.clone());
-            move |_: &u32| {
+            move |_| {
                 *me.lock() = None;
                 // Access listener state after self-cancel.
                 state.accept_count.fetch_add(1, Relaxed);
             }
         }));
-        reg.broadcast(&0);
+        reg.broadcast(0);
         assert_eq!(state.accept_count.load(Relaxed), 1);
-        reg.broadcast(&0);
+        reg.broadcast(0);
         assert_eq!(state.accept_count.load(Relaxed), 1);
     }
 
@@ -338,11 +338,11 @@ mod tests {
         let reg = NoSpinReg::new();
         let state = Arc::<State>::default();
         let victim = GuardSlot::new(Some(reg.register(Capturer(state.clone()))));
-        let _g = reg.register(move |_: &u32| *victim.lock() = None);
-        reg.broadcast(&0);
+        let _g = reg.register(move |_| *victim.lock() = None);
+        reg.broadcast(0);
         assert_eq!(state.accept_count.load(Relaxed), 0);
         assert_eq!(state.drop_count.load(Relaxed), 1);
-        reg.broadcast(&0);
+        reg.broadcast(0);
         assert_eq!(state.accept_count.load(Relaxed), 0);
     }
 
@@ -353,8 +353,8 @@ mod tests {
             victim: Arc<GuardSlot>,
         }
 
-        impl Listener<u32> for Saboteur {
-            fn accept(&self, _: &u32) { *self.me.lock() = None; }
+        impl Listener<ByVal<u32>> for Saboteur {
+            fn accept(&self, _: u32) { *self.me.lock() = None; }
         }
 
         impl Drop for Saboteur {
@@ -366,7 +366,7 @@ mod tests {
         let a = Arc::new(GuardSlot::new(Some(reg.register(Capturer(state.clone())))));
         let b = Arc::<GuardSlot>::default();
         *b.lock() = Some(reg.register(Saboteur { me: b.clone(), victim: a.clone() }));
-        reg.broadcast(&7);
+        reg.broadcast(7);
         assert_eq!(state.accept_count.load(Relaxed), 1);
         assert_eq!(state.sum.load(Relaxed), 7);
         assert_eq!(state.drop_count.load(Relaxed), 1);
@@ -378,8 +378,8 @@ mod tests {
             victim: Arc<GuardSlot>,
         }
 
-        impl Listener<u32> for Saboteur {
-            fn accept(&self, _: &u32) {}
+        impl Listener<ByVal<u32>> for Saboteur {
+            fn accept(&self, _: u32) {}
         }
 
         impl Drop for Saboteur {
@@ -406,8 +406,8 @@ mod tests {
             state: Arc<State>,
         }
 
-        impl Listener<u32> for SelfCanceller {
-            fn accept(&self, _: &u32) {}
+        impl Listener<ByVal<u32>> for SelfCanceller {
+            fn accept(&self, _: u32) {}
         }
 
         impl Drop for SelfCanceller {
@@ -434,14 +434,14 @@ mod tests {
         let state = Arc::<State>::default();
         let _g = reg.register({
             let (reg, state, depth) = (Arc::downgrade(&reg), state.clone(), AtomicU32::new(0));
-            move |event: &u32| {
+            move |event: u32| {
                 state.accept_count.fetch_add(1, Relaxed);
                 if depth.fetch_add(1, Relaxed) < 2 {
                     reg.upgrade().unwrap().broadcast(event);
                 }
             }
         });
-        reg.broadcast(&0);
+        reg.broadcast(0);
         assert_eq!(state.accept_count.load(Relaxed), 3);
     }
 
@@ -453,7 +453,7 @@ mod tests {
         thread::scope(|scope| {
             for _ in 0..8 {
                 let reg = reg.clone();
-                scope.spawn(move || reg.broadcast(&1));
+                scope.spawn(move || reg.broadcast(1));
             }
         });
         assert_eq!(state.accept_count.load(Relaxed), 32);
@@ -469,7 +469,7 @@ mod tests {
                 let reg = reg.clone();
                 scope.spawn(move || {
                     for _ in 0..5 {
-                        reg.broadcast(&1);
+                        reg.broadcast(1);
                     }
                 });
             }

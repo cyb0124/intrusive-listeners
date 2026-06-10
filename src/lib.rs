@@ -34,14 +34,37 @@
 #![no_std]
 #![feature(ptr_metadata)]
 
+use core::marker::PhantomData;
+
 extern crate alloc;
 
-pub trait Listener<T> {
-    fn accept(&self, event: &T);
+pub trait EventFamily {
+    type Event<'a>: Clone
+    where Self: 'a;
 }
 
-impl<T, F: Fn(&T)> Listener<T> for F {
-    fn accept(&self, event: &T) { self(event) }
+pub struct ByVal<T: Clone>(PhantomData<fn(T) -> T>);
+
+impl<T: Clone> EventFamily for ByVal<T> {
+    type Event<'a>
+        = T
+    where T: 'a;
+}
+
+pub struct ByRef<T>(PhantomData<fn(T) -> T>);
+
+impl<T> EventFamily for ByRef<T> {
+    type Event<'a>
+        = &'a T
+    where T: 'a;
+}
+
+pub trait Listener<T: EventFamily> {
+    fn accept(&self, event: T::Event<'_>);
+}
+
+impl<T: EventFamily, F: for<'a> Fn(T::Event<'a>)> Listener<T> for F {
+    fn accept(&self, event: T::Event<'_>) { self(event) }
 }
 
 // Bits stored in `Node::state`.
