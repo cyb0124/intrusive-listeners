@@ -45,7 +45,7 @@ unsafe fn resolve<T: EventFamily>(thin: *const ()) -> *const Node<T, dyn Listene
 }
 
 impl<T: EventFamily> Node<T, dyn Listener<T>> {
-    // Return the registry iff it just became empty.
+    /// Return the registry iff it just became empty.
     unsafe fn unlink(&self) -> *const () {
         let (prev, next) = (self.prev.get(), self.next.get());
         let mut registry = null();

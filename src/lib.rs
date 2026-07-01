@@ -1,7 +1,7 @@
 //! An intrusive, type-erased event-listener registry for `no_std` with `alloc`.
 //!
 //! A [`Registry<T>`](local::Registry) holds a list of listeners for events of
-//! type `T`. Each listener is registered through a pinned `&Registry`, where
+//! type `T::Event`. Each listener is registered through a pinned `&Registry`, where
 //! it is moved into a single heap allocation, type-erased to `dyn Listener<T>`,
 //! and referred to by a thin, one-word handle.
 //!
@@ -9,6 +9,10 @@
 //! It is an RAII scope guard that unregisters its listener when dropped. The
 //! cancellation is scan-free O(1) thanks to the intrusiveness. A guard may
 //! safely outlive its registry, in which case dropping it does nothing.
+//!
+//! Events can be passed to listeners either by value with [`ByVal<T>`](ByVal) (cloned
+//! per listener) or by reference with [`ByRef<T>`](ByRef). You can also implement the
+//! [`EventFamily`] yourself for event types that borrow from the sender's stack.
 //!
 //! # Reentrancy
 //!
