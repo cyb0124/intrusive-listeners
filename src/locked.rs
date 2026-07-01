@@ -8,10 +8,16 @@ use lock_api::RawMutex;
 
 pub trait Policy {
     type Sealable: Sealable;
+
+    /// Called when `Sealable = Yes` and the last listener is cancelled (i.e. registry just became empty).
+    /// Note that other threads may have already repopulated the registry before and during the call.
+    /// Use `try_seal` to ensure it is actually empty and stays empty.
+    fn last_listener_cancelled(&self);
 }
 
 impl Policy for () {
     type Sealable = No;
+    fn last_listener_cancelled(&self) {}
 }
 
 pub struct No;
@@ -24,18 +30,21 @@ mod private {
 }
 
 pub trait Sealable: private::Private {
+    const VALUE: bool;
     type Flag: Copy + Default;
     type RegisterResult<T>;
     fn gate_register<T>(flag: Self::Flag, f: impl FnOnce() -> T) -> Self::RegisterResult<T>;
 }
 
 impl Sealable for No {
+    const VALUE: bool = false;
     type Flag = ();
     type RegisterResult<T> = T;
     fn gate_register<T>((): (), f: impl FnOnce() -> T) -> T { f() }
 }
 
 impl Sealable for Yes {
+    const VALUE: bool = true;
     type Flag = bool;
     type RegisterResult<T> = Option<T>;
     fn gate_register<T>(flag: bool, f: impl FnOnce() -> T) -> Option<T> { (!flag).then(f) }
@@ -141,6 +150,11 @@ impl<T: EventFamily, R: RawMutex, P: Policy> Drop for Guard<T, R, P> {
             (false, true)
         } else if state & !(RECURSIVE_VISIT - 1) == 0 {
             unsafe { (*ptr).unlink(&parent.head) };
+            if <P::Sealable as Sealable>::VALUE && parent.head.get().is_null() {
+                unsafe { parent.lock.unlock() };
+                parent.policy.last_listener_cancelled();
+                parent.lock.lock();
+            }
             (true, true)
         } else {
             unsafe { (*ptr).state.set(state | RECURSIVE_CANCEL) };
@@ -236,7 +250,11 @@ impl<T: EventFamily, R: RawMutex, P: Policy> Registry<T, R, P> {
             }
             thin = next;
         }
+        let notify = <P::Sealable as Sealable>::VALUE && !deferred_cancels.is_null() && inner.head.get().is_null();
         unsafe { inner.lock.unlock() };
+        if notify {
+            inner.policy.last_listener_cancelled();
+        }
         while !deferred_cancels.is_null() {
             let ptr = unsafe { resolve::<T>(deferred_cancels) }.cast_mut();
             let node = unsafe { &mut *ptr };

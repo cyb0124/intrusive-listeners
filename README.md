@@ -3,7 +3,7 @@
 An intrusive, type-erased event-listener registry for `no_std` with `alloc`.
 
 A `Registry<T>` holds a list of listeners for events of
-type `T`. Each listener is registered through a pinned `&Registry`, where
+type `T::Event`. Each listener is registered through a pinned `&Registry`, where
 it is moved into a single heap allocation, type-erased to `dyn Listener<T>`,
 and referred to by a thin, one-word handle.
 
@@ -11,6 +11,10 @@ The handle is returned as a `Guard` by `register`.
 It is an RAII scope guard that unregisters its listener when dropped. The
 cancellation is scan-free O(1) thanks to the intrusiveness. A guard may
 safely outlive its registry, in which case dropping it does nothing.
+
+Events can be passed to listeners either by value with `ByVal<T>` (cloned
+per listener) or by reference with `ByRef<T>`. You can also implement the
+`EventFamily` yourself for event types that borrow from the sender's stack.
 
 ## Reentrancy
 
@@ -27,6 +31,15 @@ The expected behaviors are listed below.
   The new listeners will not receive the in-flight event.
 - **Accessing the registry in listener's destructor**\
   Listener's destructor may freely register, broadcast, or cancel any listener, including itself.
+
+## Cleaning up empty registry
+
+A `last_listener_cancelled` callback can be
+provided to a registry: it will be called when cancelling the last listener leaves the
+registry empty. It is meant as a clean-up hook: when a registry lives in a parent data
+structure, the hook lets you remove the now-unused registry from that structure.
+For the multithreaded variant, `try_seal` is provided to
+atomically confirm it is still empty and disable further registration.
 
 ## Caveats
 

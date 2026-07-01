@@ -30,6 +30,15 @@
 //! - **Accessing the registry in listener's destructor**\
 //!   Listener's destructor may freely register, broadcast, or cancel any listener, including itself.
 //!
+//! # Cleaning up empty registry
+//!
+//! A [`last_listener_cancelled`](local::Policy::last_listener_cancelled) callback can be
+//! provided to a registry: it will be called when cancelling the last listener leaves the
+//! registry empty. It is meant as a clean-up hook: when a registry lives in a parent data
+//! structure, the hook lets you remove the now-unused registry from that structure.
+//! For the multithreaded variant, [`try_seal`](locked::Registry::try_seal) is provided to
+//! atomically confirm it is still empty and disable further registration.
+//!
 //! # Caveats
 //!
 //! - The order in which the listeners run is unspecified.

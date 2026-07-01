@@ -10,10 +10,12 @@ pub trait Policy {
     /// Called when the last listener is cancelled (i.e. registry just became empty).
     /// Dropping the registry in this function is allowed, but doing so will invalidate `this`;
     /// hence it is a `NonNull` instead of a `&self`.
-    fn last_listener_cancelled(this: NonNull<Self>) { _ = this }
+    fn last_listener_cancelled(this: NonNull<Self>);
 }
 
-impl Policy for () {}
+impl Policy for () {
+    fn last_listener_cancelled(_: NonNull<Self>) {}
+}
 
 #[repr(C, align(2))]
 pub struct Registry<T: EventFamily, P: Policy = ()> {
