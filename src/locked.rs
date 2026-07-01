@@ -20,7 +20,7 @@ struct Inner<T: EventFamily, R: RawMutex> {
     lock: R,
     ref_count: Cell<usize>,
     head: Cell<*const ()>,
-    _p: PhantomData<fn(T) -> T>,
+    _p: PhantomData<for<'a> fn(T::Event<'a>)>,
 }
 
 unsafe impl<T: EventFamily, R: RawMutex + Send + Sync> Send for Registry<T, R> {}

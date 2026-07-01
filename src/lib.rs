@@ -45,6 +45,10 @@ pub trait EventFamily {
 
 pub struct ByVal<T: Clone>(PhantomData<fn(T) -> T>);
 
+impl<T: Clone> Default for ByVal<T> {
+    fn default() -> Self { Self(PhantomData) }
+}
+
 impl<T: Clone> EventFamily for ByVal<T> {
     type Event<'a>
         = T
@@ -52,6 +56,10 @@ impl<T: Clone> EventFamily for ByVal<T> {
 }
 
 pub struct ByRef<T>(PhantomData<fn(T) -> T>);
+
+impl<T> Default for ByRef<T> {
+    fn default() -> Self { Self(PhantomData) }
+}
 
 impl<T> EventFamily for ByRef<T> {
     type Event<'a>
