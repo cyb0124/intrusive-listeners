@@ -6,27 +6,27 @@ use core::mem::ManuallyDrop;
 use core::pin::Pin;
 use core::ptr::{self, DynMetadata, NonNull, null};
 
-pub trait Hooks {
+pub trait Policy {
     /// Called when the last listener is cancelled (i.e. registry just became empty).
     /// Dropping the registry in this function is allowed, but doing so will invalidate `this`;
     /// hence it is a `NonNull` instead of a `&self`.
     fn last_listener_cancelled(this: NonNull<Self>) { _ = this }
 }
 
-impl Hooks for () {}
+impl Policy for () {}
 
 #[repr(C, align(2))]
-pub struct Registry<T: EventFamily, H: Hooks = ()> {
+pub struct Registry<T: EventFamily, P: Policy = ()> {
     head: Cell<*const ()>,
-    pub hooks: H,
+    pub policy: P,
     _p: PhantomData<for<'a> fn(T::Event<'a>)>,
     _pin: PhantomPinned,
 }
 
 #[must_use]
-pub struct Guard<T: EventFamily, H: Hooks = ()> {
+pub struct Guard<T: EventFamily, P: Policy = ()> {
     node: *const (),
-    _p: PhantomData<*const Registry<T, H>>,
+    _p: PhantomData<*const Registry<T, P>>,
 }
 
 #[repr(C, align(2))]
@@ -63,7 +63,7 @@ impl<T: EventFamily> Node<T, dyn Listener<T>> {
     }
 }
 
-impl<T: EventFamily, H: Hooks> Drop for Registry<T, H> {
+impl<T: EventFamily, P: Policy> Drop for Registry<T, P> {
     fn drop(&mut self) {
         let mut thin = self.head.get();
         while !thin.is_null() {
@@ -86,7 +86,7 @@ impl<T: EventFamily, H: Hooks> Drop for Registry<T, H> {
     }
 }
 
-impl<T: EventFamily, H: Hooks> Drop for Guard<T, H> {
+impl<T: EventFamily, P: Policy> Drop for Guard<T, P> {
     /// May overlap listener destructor.
     fn drop(&mut self) {
         let ptr = unsafe { resolve::<T>(self.node) };
@@ -97,7 +97,7 @@ impl<T: EventFamily, H: Hooks> Drop for Guard<T, H> {
             let node = unsafe { &mut *ptr.cast_mut() };
             let registry = unsafe { node.unlink() };
             if !registry.is_null() {
-                H::last_listener_cancelled(NonNull::from_ref(unsafe { &(*registry.cast::<Registry<T, H>>()).hooks }));
+                P::last_listener_cancelled(NonNull::from_ref(unsafe { &(*registry.cast::<Registry<T, P>>()).policy }));
             }
             unsafe { ManuallyDrop::drop(&mut node.listener) };
             drop(unsafe { Box::from_raw(ptr.cast_mut()) });
@@ -107,16 +107,16 @@ impl<T: EventFamily, H: Hooks> Drop for Guard<T, H> {
     }
 }
 
-impl<T: EventFamily, H: Hooks + Default> Default for Registry<T, H> {
-    fn default() -> Self { Self::new(H::default()) }
+impl<T: EventFamily, P: Policy + Default> Default for Registry<T, P> {
+    fn default() -> Self { Self::new(P::default()) }
 }
 
-impl<T: EventFamily, H: Hooks> Registry<T, H> {
-    pub const fn new(hooks: H) -> Self { Self { head: Cell::new(null()), hooks, _p: PhantomData, _pin: PhantomPinned } }
+impl<T: EventFamily, P: Policy> Registry<T, P> {
+    pub const fn new(policy: P) -> Self { Self { head: Cell::new(null()), policy, _p: PhantomData, _pin: PhantomPinned } }
 
     pub fn is_empty(&self) -> bool { self.head.get().is_null() }
 
-    pub fn register(self: Pin<&Self>, listener: impl Listener<T> + 'static) -> Guard<T, H> {
+    pub fn register(self: Pin<&Self>, listener: impl Listener<T> + 'static) -> Guard<T, P> {
         let next = self.head.get();
         let node = Box::new(Node {
             meta: ptr::metadata(&listener as &dyn Listener<T>),
@@ -158,7 +158,7 @@ impl<T: EventFamily, H: Hooks> Registry<T, H> {
             thin = next;
         }
         if !deferred_cancels.is_null() && self.is_empty() {
-            H::last_listener_cancelled(NonNull::from_ref(&self.hooks));
+            P::last_listener_cancelled(NonNull::from_ref(&self.policy));
         }
         while !deferred_cancels.is_null() {
             let ptr = unsafe { resolve::<T>(deferred_cancels) }.cast_mut();
@@ -174,7 +174,7 @@ impl<T: EventFamily, H: Hooks> Registry<T, H> {
 mod tests {
     extern crate std;
 
-    use super::{Guard, Hooks, Registry};
+    use super::{Guard, Policy, Registry};
     use crate::{ByVal, Listener};
     use alloc::rc::{Rc, Weak};
     use core::array;
@@ -184,12 +184,12 @@ mod tests {
 
     struct Counter(Rc<Cell<u32>>);
 
-    impl Hooks for Counter {
+    impl Policy for Counter {
         fn last_listener_cancelled(this: NonNull<Self>) { unsafe { this.as_ref() }.0.update(|x| x + 1); }
     }
 
     #[test]
-    fn guard_drop_calls_hooks() {
+    fn guard_drop_notifies_policy() {
         let ctr = Rc::new(Cell::new(0u32));
         let reg = pin!(Registry::<ByVal<u32>, _>::new(Counter(ctr.clone())));
         let reg = reg.as_ref();
@@ -205,7 +205,7 @@ mod tests {
     }
 
     #[test]
-    fn self_cancel_calls_hooks() {
+    fn self_cancel_notifies_policy() {
         let ctr = Rc::new(Cell::new(0u32));
         let reg = pin!(Registry::<ByVal<u32>, _>::new(Counter(ctr.clone())));
         let reg = reg.as_ref();
@@ -219,13 +219,13 @@ mod tests {
     }
 
     #[test]
-    fn hooks_observe_empty_before_destructor_reregisters() {
+    fn policy_observes_empty_before_destructor_reregisters() {
         type Reg = Registry<ByVal<u32>, Observer>;
         struct Observer {
             reg: OnceCell<Weak<Reg>>,
             empty_observed: Rc<Cell<bool>>,
         }
-        impl Hooks for Observer {
+        impl Policy for Observer {
             fn last_listener_cancelled(this: NonNull<Self>) {
                 let this = unsafe { this.as_ref() };
                 let reg = this.reg.get().unwrap().upgrade().unwrap();
@@ -249,7 +249,7 @@ mod tests {
         }
         let empty_observed = Rc::new(Cell::new(false));
         let reg = Rc::new(Reg::new(Observer { reg: OnceCell::new(), empty_observed: empty_observed.clone() }));
-        reg.hooks.reg.get_or_init(|| Rc::downgrade(&reg));
+        reg.policy.reg.get_or_init(|| Rc::downgrade(&reg));
         let child = Rc::new(OnceCell::new());
         let guard = unsafe { Pin::new_unchecked(&*reg) }.register(Reregisterer { reg: Rc::downgrade(&reg), child: child.clone() });
         drop(guard);
