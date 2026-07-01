@@ -6,70 +6,75 @@ use core::mem::ManuallyDrop;
 use core::ptr::{self, DynMetadata, null};
 use lock_api::RawMutex;
 
-pub struct Registry<T: EventFamily, R: RawMutex> {
-    inner: *const Inner<T, R>,
+pub trait Policy {}
+
+impl Policy for () {}
+
+pub struct Registry<T: EventFamily, R: RawMutex, P: Policy = ()> {
+    inner: *const Inner<T, R, P>,
 }
 
 #[must_use]
-pub struct Guard<T: EventFamily, R: RawMutex> {
+pub struct Guard<T: EventFamily, R: RawMutex, P: Policy = ()> {
     node: *const (),
-    _p: PhantomData<Inner<T, R>>,
+    _p: PhantomData<Inner<T, R, P>>,
 }
 
-struct Inner<T: EventFamily, R: RawMutex> {
+struct Inner<T: EventFamily, R: RawMutex, P: Policy> {
     lock: R,
     ref_count: Cell<usize>,
     head: Cell<*const ()>,
+    policy: P,
     _p: PhantomData<for<'a> fn(T::Event<'a>)>,
 }
 
-unsafe impl<T: EventFamily, R: RawMutex + Send + Sync> Send for Registry<T, R> {}
-unsafe impl<T: EventFamily, R: RawMutex + Send + Sync> Sync for Registry<T, R> {}
-unsafe impl<T: EventFamily, R: RawMutex + Send + Sync> Send for Guard<T, R> {}
-unsafe impl<T: EventFamily, R: RawMutex> Sync for Guard<T, R> {}
+unsafe impl<T: EventFamily, R: RawMutex + Send + Sync, P: Policy + Send + Sync> Send for Registry<T, R, P> {}
+unsafe impl<T: EventFamily, R: RawMutex + Send + Sync, P: Policy + Send + Sync> Sync for Registry<T, R, P> {}
+unsafe impl<T: EventFamily, R: RawMutex + Send + Sync, P: Policy + Send + Sync> Send for Guard<T, R, P> {}
+unsafe impl<T: EventFamily, R: RawMutex, P: Policy> Sync for Guard<T, R, P> {}
 
 #[repr(C)]
-struct Node<T: EventFamily, R: RawMutex, L: Listener<T> + ?Sized> {
+struct Node<T: EventFamily, L: Listener<T> + ?Sized> {
     meta: DynMetadata<dyn Listener<T>>,
-    parent: *const Inner<T, R>,
+    parent: *const (),
     prev: Cell<*const ()>,
     next: Cell<*const ()>,
     state: Cell<usize>,
     listener: ManuallyDrop<L>,
 }
 
-unsafe fn resolve<T: EventFamily, R: RawMutex>(thin: *const ()) -> *const Node<T, R, dyn Listener<T>> {
+unsafe fn resolve<T: EventFamily>(thin: *const ()) -> *const Node<T, dyn Listener<T>> {
     let meta = unsafe { *thin.cast::<DynMetadata<dyn Listener<T>>>() };
-    ptr::from_raw_parts::<Node<T, R, dyn Listener<T>>>(thin, meta)
+    ptr::from_raw_parts::<Node<T, dyn Listener<T>>>(thin, meta)
 }
 
-impl<T: EventFamily, R: RawMutex> Node<T, R, dyn Listener<T>> {
-    unsafe fn unlink(&self, parent: &Inner<T, R>) {
+impl<T: EventFamily> Node<T, dyn Listener<T>> {
+    unsafe fn unlink(&self, head: &Cell<*const ()>) {
         let (prev, next) = (self.prev.get(), self.next.get());
         if prev.is_null() {
-            parent.head.set(next);
+            head.set(next);
         } else {
-            unsafe { (*resolve::<T, R>(prev)).next.set(next) };
+            unsafe { (*resolve::<T>(prev)).next.set(next) };
         }
         if !next.is_null() {
-            unsafe { (*resolve::<T, R>(next)).prev.set(prev) };
+            unsafe { (*resolve::<T>(next)).prev.set(prev) };
         }
     }
 }
 
-impl<T: EventFamily, R: RawMutex> Drop for Registry<T, R> {
+impl<T: EventFamily, R: RawMutex, P: Policy> Drop for Registry<T, R, P> {
     fn drop(&mut self) {
         let inner = unsafe { &*self.inner };
         inner.lock.lock();
         let mut thin = inner.head.get();
         while !thin.is_null() {
-            let node = unsafe { &mut *resolve::<T, R>(thin).cast_mut() };
+            let node = unsafe { &mut *resolve::<T>(thin).cast_mut() };
             *node.state.get_mut() |= RECURSIVE_VISIT;
             thin = *node.next.get_mut();
         }
         thin = inner.head.get();
         while !thin.is_null() {
-            let ptr = unsafe { resolve::<T, R>(thin) }.cast_mut();
+            let ptr = unsafe { resolve::<T>(thin) }.cast_mut();
             thin = unsafe { *(*ptr).next.get_mut() };
             unsafe { inner.lock.unlock() };
             unsafe { ManuallyDrop::drop(&mut (*ptr).listener) };
@@ -92,18 +97,18 @@ impl<T: EventFamily, R: RawMutex> Drop for Registry<T, R> {
     }
 }
 
-impl<T: EventFamily, R: RawMutex> Drop for Guard<T, R> {
+impl<T: EventFamily, R: RawMutex, P: Policy> Drop for Guard<T, R, P> {
     /// May overlap listener destructor.
     fn drop(&mut self) {
-        let ptr = unsafe { resolve::<T, R>(self.node) };
-        let parent_ptr = unsafe { (*ptr).parent };
+        let ptr = unsafe { resolve::<T>(self.node) };
+        let parent_ptr = unsafe { (*ptr).parent.cast::<Inner<T, R, P>>() };
         let parent = unsafe { &*parent_ptr };
         parent.lock.lock();
         let state = unsafe { (*ptr).state.get() };
         let (destruct, free) = if state & ALIVE == 0 {
             (false, true)
         } else if state & !(RECURSIVE_VISIT - 1) == 0 {
-            unsafe { (*ptr).unlink(parent) };
+            unsafe { (*ptr).unlink(&parent.head) };
             (true, true)
         } else {
             unsafe { (*ptr).state.set(state | RECURSIVE_CANCEL) };
@@ -127,24 +132,24 @@ impl<T: EventFamily, R: RawMutex> Drop for Guard<T, R> {
     }
 }
 
-impl<T: EventFamily, R: RawMutex> Default for Registry<T, R> {
-    fn default() -> Self { Self::new() }
+impl<T: EventFamily, R: RawMutex, P: Policy + Default> Default for Registry<T, R, P> {
+    fn default() -> Self { Self::new(P::default()) }
 }
 
-impl<T: EventFamily, R: RawMutex> Registry<T, R> {
-    pub fn new() -> Self {
-        Self { inner: Box::into_raw(Box::new(Inner { lock: R::INIT, head: Cell::new(null()), ref_count: Cell::new(1), _p: PhantomData })) }
+impl<T: EventFamily, R: RawMutex, P: Policy> Registry<T, R, P> {
+    pub fn new(policy: P) -> Self {
+        Self { inner: Box::into_raw(Box::new(Inner { lock: R::INIT, head: Cell::new(null()), ref_count: Cell::new(1), policy, _p: PhantomData })) }
     }
 
-    pub fn register(&self, listener: impl Listener<T> + Send + Sync + 'static) -> Guard<T, R> {
+    pub fn register(&self, listener: impl Listener<T> + Send + Sync + 'static) -> Guard<T, R, P> {
         let mut node = Box::new(Node {
             meta: ptr::metadata(&listener as &dyn Listener<T>),
-            parent: self.inner,
+            parent: self.inner.cast::<()>(),
             prev: Cell::new(null()),
             next: Cell::new(null()),
             state: Cell::new(ALIVE),
             listener: ManuallyDrop::new(listener),
-        }) as Box<Node<T, R, dyn Listener<T>>>;
+        }) as Box<Node<T, dyn Listener<T>>>;
         let inner = unsafe { &*self.inner };
         inner.lock.lock();
         let next = inner.head.get();
@@ -152,7 +157,7 @@ impl<T: EventFamily, R: RawMutex> Registry<T, R> {
         let thin = Box::into_raw(node).cast_const().to_raw_parts().0;
         inner.head.set(thin);
         if !next.is_null() {
-            unsafe { &*resolve::<T, R>(next) }.prev.set(thin);
+            unsafe { &*resolve::<T>(next) }.prev.set(thin);
         }
         inner.ref_count.update(|x| x + 1);
         unsafe { inner.lock.unlock() };
@@ -165,7 +170,7 @@ impl<T: EventFamily, R: RawMutex> Registry<T, R> {
         let mut deferred_cancels = null::<()>();
         let mut thin = inner.head.get();
         while !thin.is_null() {
-            let node = unsafe { &*resolve::<T, R>(thin) };
+            let node = unsafe { &*resolve::<T>(thin) };
             let mut state = node.state.get();
             if state & RECURSIVE_CANCEL != 0 {
                 // Node already cancelled by an outer `accept` call. Outermost `broadcast` will unlink it.
@@ -179,7 +184,7 @@ impl<T: EventFamily, R: RawMutex> Registry<T, R> {
             let next = node.next.get();
             state = node.state.get() - RECURSIVE_VISIT;
             if state & !(RECURSIVE_CANCEL - 1) == RECURSIVE_CANCEL {
-                unsafe { node.unlink(inner) };
+                unsafe { node.unlink(&inner.head) };
                 node.next.set(deferred_cancels);
                 deferred_cancels = thin;
             } else {
@@ -189,7 +194,7 @@ impl<T: EventFamily, R: RawMutex> Registry<T, R> {
         }
         unsafe { inner.lock.unlock() };
         while !deferred_cancels.is_null() {
-            let ptr = unsafe { resolve::<T, R>(deferred_cancels) }.cast_mut();
+            let ptr = unsafe { resolve::<T>(deferred_cancels) }.cast_mut();
             let node = unsafe { &mut *ptr };
             deferred_cancels = *node.next.get_mut();
             unsafe { ManuallyDrop::drop(&mut node.listener) };
@@ -255,7 +260,7 @@ mod tests {
 
     #[test]
     fn normal_path() {
-        let reg = NoSpinReg::new();
+        let reg = NoSpinReg::default();
         let states = <[Arc<State>; 3]>::default();
         let _guards = states.each_ref().map(|x| reg.register(Capturer(x.clone())));
         reg.broadcast(3);
@@ -269,7 +274,7 @@ mod tests {
         let state = Arc::<State>::default();
         let _guards: [_; 2];
         {
-            let reg = NoSpinReg::new();
+            let reg = NoSpinReg::default();
             _guards = array::from_fn(|_| reg.register(Capturer(state.clone())));
         }
         assert_eq!(state.drop_count.load(Relaxed), 2);
@@ -278,7 +283,7 @@ mod tests {
     #[test]
     fn registry_dropped_late() {
         let state = Arc::<State>::default();
-        let reg = NoSpinReg::new();
+        let reg = NoSpinReg::default();
         let guards: [_; 3] = array::from_fn(|_| reg.register(Capturer(state.clone())));
         drop(guards);
         assert_eq!(state.drop_count.load(Relaxed), 3);
@@ -287,7 +292,7 @@ mod tests {
     #[test]
     fn cancel_internal() {
         let state = Arc::<State>::default();
-        let reg = NoSpinReg::new();
+        let reg = NoSpinReg::default();
         let [_a, b, _c] = array::from_fn(|_| reg.register(Capturer(state.clone())));
         drop(b);
         assert_eq!(state.drop_count.load(Relaxed), 1);
@@ -316,7 +321,7 @@ mod tests {
 
     #[test]
     fn self_cancel() {
-        let reg = NoSpinReg::new();
+        let reg = NoSpinReg::default();
         let state = Arc::<State>::default();
         let guard = Arc::<GuardSlot>::default();
         *guard.lock() = Some(reg.register({
@@ -335,7 +340,7 @@ mod tests {
 
     #[test]
     fn cancel_in_flight() {
-        let reg = NoSpinReg::new();
+        let reg = NoSpinReg::default();
         let state = Arc::<State>::default();
         let victim = GuardSlot::new(Some(reg.register(Capturer(state.clone()))));
         let _g = reg.register(move |_| *victim.lock() = None);
@@ -361,7 +366,7 @@ mod tests {
             fn drop(&mut self) { *self.victim.lock() = None; }
         }
 
-        let reg: NoSpinReg = Registry::new();
+        let reg: NoSpinReg = Registry::default();
         let state = Arc::<State>::default();
         let a = Arc::new(GuardSlot::new(Some(reg.register(Capturer(state.clone())))));
         let b = Arc::<GuardSlot>::default();
@@ -389,7 +394,7 @@ mod tests {
         let state = Arc::<State>::default();
         let a = Arc::<GuardSlot>::default();
         let b = {
-            let reg = NoSpinReg::new();
+            let reg = NoSpinReg::default();
             *a.lock() = Some(reg.register(Capturer(state.clone())));
             reg.register(Saboteur { victim: a.clone() })
         };
@@ -421,7 +426,7 @@ mod tests {
         let state = Arc::<State>::default();
         let me = Arc::<GuardSlot>::default();
         {
-            let reg = NoSpinReg::new();
+            let reg = NoSpinReg::default();
             *me.lock() = Some(reg.register(SelfCanceller { me: me.clone(), state: state.clone() }));
         }
         assert_eq!(state.drop_count.load(Relaxed), 1);
@@ -489,7 +494,7 @@ mod tests {
     #[test]
     fn concurrent_registry_guard_drop() {
         let state = Arc::<State>::default();
-        let reg = SpinReg::new();
+        let reg = SpinReg::default();
         let guards: [_; 16] = array::from_fn(|_| reg.register(Capturer(state.clone())));
         thread::scope(|s| {
             s.spawn(move || drop(reg));
