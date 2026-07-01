@@ -6,9 +6,40 @@ use core::mem::ManuallyDrop;
 use core::ptr::{self, DynMetadata, null};
 use lock_api::RawMutex;
 
-pub trait Policy {}
+pub trait Policy {
+    type Sealable: Sealable;
+}
 
-impl Policy for () {}
+impl Policy for () {
+    type Sealable = No;
+}
+
+pub struct No;
+pub struct Yes;
+
+mod private {
+    pub trait Private {}
+    impl Private for super::No {}
+    impl Private for super::Yes {}
+}
+
+pub trait Sealable: private::Private {
+    type Flag: Copy + Default;
+    type RegisterResult<T>;
+    fn gate_register<T>(flag: Self::Flag, f: impl FnOnce() -> T) -> Self::RegisterResult<T>;
+}
+
+impl Sealable for No {
+    type Flag = ();
+    type RegisterResult<T> = T;
+    fn gate_register<T>((): (), f: impl FnOnce() -> T) -> T { f() }
+}
+
+impl Sealable for Yes {
+    type Flag = bool;
+    type RegisterResult<T> = Option<T>;
+    fn gate_register<T>(flag: bool, f: impl FnOnce() -> T) -> Option<T> { (!flag).then(f) }
+}
 
 pub struct Registry<T: EventFamily, R: RawMutex, P: Policy = ()> {
     inner: *const Inner<T, R, P>,
@@ -22,6 +53,7 @@ pub struct Guard<T: EventFamily, R: RawMutex, P: Policy = ()> {
 
 struct Inner<T: EventFamily, R: RawMutex, P: Policy> {
     lock: R,
+    sealed: Cell<<P::Sealable as Sealable>::Flag>,
     ref_count: Cell<usize>,
     head: Cell<*const ()>,
     policy: P,
@@ -138,30 +170,42 @@ impl<T: EventFamily, R: RawMutex, P: Policy + Default> Default for Registry<T, R
 
 impl<T: EventFamily, R: RawMutex, P: Policy> Registry<T, R, P> {
     pub fn new(policy: P) -> Self {
-        Self { inner: Box::into_raw(Box::new(Inner { lock: R::INIT, head: Cell::new(null()), ref_count: Cell::new(1), policy, _p: PhantomData })) }
+        Self {
+            inner: Box::into_raw(Box::new(Inner {
+                lock: R::INIT,
+                sealed: <_>::default(),
+                ref_count: Cell::new(1),
+                head: Cell::new(null()),
+                policy,
+                _p: PhantomData,
+            })),
+        }
     }
 
-    pub fn register(&self, listener: impl Listener<T> + Send + Sync + 'static) -> Guard<T, R, P> {
-        let mut node = Box::new(Node {
-            meta: ptr::metadata(&listener as &dyn Listener<T>),
-            parent: self.inner.cast::<()>(),
-            prev: Cell::new(null()),
-            next: Cell::new(null()),
-            state: Cell::new(ALIVE),
-            listener: ManuallyDrop::new(listener),
-        }) as Box<Node<T, dyn Listener<T>>>;
+    pub fn register(&self, listener: impl Listener<T> + Send + Sync + 'static) -> <P::Sealable as Sealable>::RegisterResult<Guard<T, R, P>> {
         let inner = unsafe { &*self.inner };
         inner.lock.lock();
-        let next = inner.head.get();
-        *node.next.get_mut() = next;
-        let thin = Box::into_raw(node).cast_const().to_raw_parts().0;
-        inner.head.set(thin);
-        if !next.is_null() {
-            unsafe { &*resolve::<T>(next) }.prev.set(thin);
-        }
-        inner.ref_count.update(|x| x + 1);
+        let result = <P::Sealable as Sealable>::gate_register(inner.sealed.get(), || {
+            let mut node = Box::new(Node {
+                meta: ptr::metadata(&listener as &dyn Listener<T>),
+                parent: self.inner.cast::<()>(),
+                prev: Cell::new(null()),
+                next: Cell::new(null()),
+                state: Cell::new(ALIVE),
+                listener: ManuallyDrop::new(listener),
+            }) as Box<Node<T, dyn Listener<T>>>;
+            let next = inner.head.get();
+            *node.next.get_mut() = next;
+            let thin = Box::into_raw(node).cast_const().to_raw_parts().0;
+            inner.head.set(thin);
+            if !next.is_null() {
+                unsafe { &*resolve::<T>(next) }.prev.set(thin);
+            }
+            inner.ref_count.update(|x| x + 1);
+            Guard { node: thin, _p: PhantomData }
+        });
         unsafe { inner.lock.unlock() };
-        Guard { node: thin, _p: PhantomData }
+        result
     }
 
     pub fn broadcast(&self, event: T::Event<'_>) {
@@ -200,6 +244,20 @@ impl<T: EventFamily, R: RawMutex, P: Policy> Registry<T, R, P> {
             unsafe { ManuallyDrop::drop(&mut node.listener) };
             drop(unsafe { Box::from_raw(ptr) });
         }
+    }
+}
+
+impl<T: EventFamily, R: RawMutex, P: Policy<Sealable = Yes>> Registry<T, R, P> {
+    /// Atomically check if the registry is empty, and if true, prevent it to ever become non-empty again.
+    pub fn try_seal(&self) -> bool {
+        let inner = unsafe { &*self.inner };
+        inner.lock.lock();
+        let empty = inner.head.get().is_null();
+        if empty {
+            inner.sealed.set(true);
+        }
+        unsafe { inner.lock.unlock() };
+        empty
     }
 }
 
