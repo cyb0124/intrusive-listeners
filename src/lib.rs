@@ -14,6 +14,8 @@
 //! per listener) or by reference with [`ByRef<T>`](ByRef). You can also implement the
 //! [`EventFamily`] yourself for event types that borrow from the sender's stack.
 //!
+//! Some features of each registry can be selected at compile time via the [`Policy`](locked::Policy) trait.
+//!
 //! # Reentrancy
 //!
 //! This implementation tolerates all kinds of recursive update scenarios.
@@ -26,7 +28,8 @@
 //! - **Listener calling [`broadcast`](local::Registry::broadcast) again in its callback (recursive notification)**\
 //!   Callbacks for the new event will immediately run inside the nested `broadcast` call.
 //! - **Registering new listeners inside a listener callback**\
-//!   The new listeners will not receive the in-flight event.
+//!   With [`LIFO`] (default) ordering, the new listeners will not receive the in-flight event.
+//!   Otherwise ([`FIFO`]), they will.
 //! - **Accessing the registry in listener's destructor**\
 //!   Listener's destructor may freely register, broadcast, or cancel any listener, including itself.
 //!
@@ -41,12 +44,12 @@
 //!
 //! # Caveats
 //!
-//! - The order in which the listeners run is unspecified.
 //! - This crate requires a nightly compiler (needed for accessing vtable pointers).
 
 #![no_std]
 #![feature(ptr_metadata)]
 
+use core::hint::unreachable_unchecked;
 use core::marker::PhantomData;
 
 extern crate alloc;
@@ -86,6 +89,37 @@ pub trait Listener<T: EventFamily> {
 
 impl<T: EventFamily, F: for<'a> Fn(T::Event<'a>)> Listener<T> for F {
     fn accept(&self, event: T::Event<'_>) { self(event) }
+}
+
+mod private {
+    pub trait Private {}
+}
+
+pub struct FIFO;
+pub struct LIFO;
+
+impl private::Private for FIFO {}
+impl private::Private for LIFO {}
+
+pub trait Ordering: private::Private {
+    type Tail: Copy + Default;
+    const FIFO: bool;
+    fn from_tail(x: Self::Tail) -> *const ();
+    fn into_tail(x: *const ()) -> Self::Tail;
+}
+
+impl Ordering for LIFO {
+    type Tail = ();
+    const FIFO: bool = false;
+    fn from_tail((): ()) -> *const () { unsafe { unreachable_unchecked() } }
+    fn into_tail(_: *const ()) {}
+}
+
+impl Ordering for FIFO {
+    type Tail = *const ();
+    const FIFO: bool = true;
+    fn from_tail(x: *const ()) -> *const () { x }
+    fn into_tail(x: *const ()) -> *const () { x }
 }
 
 // Bits stored in `Node::state`.

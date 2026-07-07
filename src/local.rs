@@ -1,4 +1,4 @@
-use crate::{ALIVE, EventFamily, Listener, RECURSIVE_CANCEL, RECURSIVE_VISIT};
+use crate::{ALIVE, EventFamily, LIFO, Listener, Ordering, RECURSIVE_CANCEL, RECURSIVE_VISIT};
 use alloc::boxed::Box;
 use core::cell::Cell;
 use core::marker::{PhantomData, PhantomPinned};
@@ -7,6 +7,8 @@ use core::pin::Pin;
 use core::ptr::{self, DynMetadata, NonNull, null};
 
 pub trait Policy {
+    type Ordering: Ordering;
+
     /// Called when the last listener is cancelled (i.e. registry just became empty).
     /// Dropping the registry in this function is allowed, but doing so will invalidate `this`;
     /// hence it is a `NonNull` instead of a `&self`.
@@ -14,12 +16,14 @@ pub trait Policy {
 }
 
 impl Policy for () {
+    type Ordering = LIFO;
     fn last_listener_cancelled(_: NonNull<Self>) {}
 }
 
 #[repr(C, align(2))]
 pub struct Registry<T: EventFamily, P: Policy = ()> {
     head: Cell<*const ()>,
+    tail: Cell<<P::Ordering as Ordering>::Tail>,
     pub policy: P,
     _p: PhantomData<for<'a> fn(T::Event<'a>)>,
     _pin: PhantomPinned,
@@ -34,8 +38,9 @@ pub struct Guard<T: EventFamily, P: Policy = ()> {
 #[repr(C, align(2))]
 struct Node<T: EventFamily, L: Listener<T> + ?Sized> {
     meta: DynMetadata<dyn Listener<T>>,
-    /// If LSB=1, it points back to the registry.
+    /// At head, points back to the registry with LSB=1.
     prev: Cell<*const ()>,
+    /// At tail, points back to the registry with LSB=1.
     next: Cell<*const ()>,
     state: Cell<usize>,
     listener: ManuallyDrop<L>,
@@ -48,18 +53,22 @@ unsafe fn resolve<T: EventFamily>(thin: *const ()) -> *const Node<T, dyn Listene
 
 impl<T: EventFamily> Node<T, dyn Listener<T>> {
     /// Return the registry iff it just became empty.
-    unsafe fn unlink(&self) -> *const () {
+    unsafe fn unlink<O: Ordering>(&self) -> *const () {
         let (prev, next) = (self.prev.get(), self.next.get());
+        let is_tail = next.addr() & 1 == 1;
         let mut registry = null();
         if prev.addr() & 1 == 1 {
             registry = prev.map_addr(|x| x & !1);
-            unsafe { (*registry.cast::<Cell<*const ()>>()).set(next) };
+            unsafe { (*registry.cast::<Cell<*const ()>>()).set(if is_tail { null() } else { next }) };
         } else {
             unsafe { (*resolve::<T>(prev)).next.set(next) };
         }
-        if !next.is_null() {
+        if !is_tail {
             unsafe { (*resolve::<T>(next)).prev.set(prev) };
             registry = null();
+        } else if O::FIFO {
+            let tail = unsafe { &*next.map_addr(|x| x & !1).cast::<Cell<*const ()>>().add(1) };
+            tail.set(if registry.is_null() { prev } else { null() });
         }
         registry
     }
@@ -67,16 +76,14 @@ impl<T: EventFamily> Node<T, dyn Listener<T>> {
 
 impl<T: EventFamily, P: Policy> Drop for Registry<T, P> {
     fn drop(&mut self) {
-        let mut thin = self.head.get();
-        while !thin.is_null() {
+        self.walk(|thin| {
             let node = unsafe { &mut *resolve::<T>(thin).cast_mut() };
             *node.state.get_mut() |= RECURSIVE_VISIT;
-            thin = *node.next.get_mut();
-        }
-        thin = self.head.get();
-        while !thin.is_null() {
+            *node.next.get_mut()
+        });
+        self.walk(|thin| {
             let ptr = unsafe { resolve::<T>(thin) }.cast_mut();
-            thin = unsafe { *(*ptr).next.get_mut() };
+            let next = unsafe { *(*ptr).next.get_mut() };
             unsafe { ManuallyDrop::drop(&mut (*ptr).listener) };
             let state = unsafe { (*ptr).state.get_mut() };
             if *state & RECURSIVE_CANCEL != 0 {
@@ -84,7 +91,8 @@ impl<T: EventFamily, P: Policy> Drop for Registry<T, P> {
             } else {
                 *state &= !ALIVE;
             }
-        }
+            next
+        });
     }
 }
 
@@ -97,7 +105,7 @@ impl<T: EventFamily, P: Policy> Drop for Guard<T, P> {
             drop(unsafe { Box::from_raw(ptr.cast_mut()) });
         } else if state & !(RECURSIVE_VISIT - 1) == 0 {
             let node = unsafe { &mut *ptr.cast_mut() };
-            let registry = unsafe { node.unlink() };
+            let registry = unsafe { node.unlink::<P::Ordering>() };
             if !registry.is_null() {
                 P::last_listener_cancelled(NonNull::from_ref(unsafe { &(*registry.cast::<Registry<T, P>>()).policy }));
             }
@@ -114,51 +122,69 @@ impl<T: EventFamily, P: Policy + Default> Default for Registry<T, P> {
 }
 
 impl<T: EventFamily, P: Policy> Registry<T, P> {
-    pub const fn new(policy: P) -> Self { Self { head: Cell::new(null()), policy, _p: PhantomData, _pin: PhantomPinned } }
+    pub fn new(policy: P) -> Self { Self { head: <_>::default(), tail: <_>::default(), policy, _p: PhantomData, _pin: PhantomPinned } }
 
     pub fn is_empty(&self) -> bool { self.head.get().is_null() }
 
     pub fn register(self: Pin<&Self>, listener: impl Listener<T> + 'static) -> Guard<T, P> {
-        let next = self.head.get();
+        let old = if <P::Ordering as Ordering>::FIFO { <P::Ordering as Ordering>::from_tail(self.tail.get()) } else { self.head.get() };
+        let sentinel = (&raw const *self).map_addr(|x| x | 1).cast::<()>();
+        let old_as_link = if old.is_null() { sentinel } else { old };
+        let (prev, next) = if <P::Ordering as Ordering>::FIFO { (old_as_link, sentinel) } else { (sentinel, old_as_link) };
         let node = Box::new(Node {
             meta: ptr::metadata(&listener as &dyn Listener<T>),
-            prev: (&raw const *self).map_addr(|x| x | 1).cast::<()>().into(),
+            prev: prev.into(),
             next: next.into(),
             state: Cell::new(ALIVE),
             listener: ManuallyDrop::new(listener),
         }) as Box<Node<T, dyn Listener<T>>>;
         let thin = Box::into_raw(node).cast_const().to_raw_parts().0;
-        self.head.set(thin);
-        if !next.is_null() {
-            unsafe { &*resolve::<T>(next) }.prev.set(thin);
+        if <P::Ordering as Ordering>::FIFO {
+            if old.is_null() { &self.head } else { &unsafe { &*resolve::<T>(old) }.next }.set(thin);
+            self.tail.set(<P::Ordering as Ordering>::into_tail(thin));
+        } else {
+            self.head.set(thin);
+            if !old.is_null() {
+                unsafe { &*resolve::<T>(old) }.prev.set(thin);
+            }
         }
         Guard { node: thin, _p: PhantomData }
     }
 
+    fn walk(&self, mut f: impl FnMut(*const ()) -> *const ()) {
+        let mut thin = self.head.get();
+        if !thin.is_null() {
+            loop {
+                thin = f(thin);
+                if thin.addr() & 1 == 1 {
+                    break;
+                }
+            }
+        }
+    }
+
     pub fn broadcast(&self, event: T::Event<'_>) {
         let mut deferred_cancels = null::<()>();
-        let mut thin = self.head.get();
-        while !thin.is_null() {
+        self.walk(|thin| {
             let node = unsafe { &*resolve::<T>(thin) };
             let mut state = node.state.get();
             if state & RECURSIVE_CANCEL != 0 {
                 // Node already cancelled by an outer `accept` call. Outermost `broadcast` will unlink it.
-                thin = node.next.get();
-                continue;
+                return node.next.get();
             }
             node.state.set(state + RECURSIVE_VISIT);
             node.listener.accept(event.clone());
             let next = node.next.get();
             state = node.state.get() - RECURSIVE_VISIT;
             if state & !(RECURSIVE_CANCEL - 1) == RECURSIVE_CANCEL {
-                unsafe { node.unlink() };
+                unsafe { node.unlink::<P::Ordering>() };
                 node.next.set(deferred_cancels);
                 deferred_cancels = thin;
             } else {
                 node.state.set(state);
             }
-            thin = next;
-        }
+            next
+        });
         if !deferred_cancels.is_null() && self.is_empty() {
             P::last_listener_cancelled(NonNull::from_ref(&self.policy));
         }
@@ -177,23 +203,32 @@ mod tests {
     extern crate std;
 
     use super::{Guard, Policy, Registry};
-    use crate::{ByVal, Listener};
+    use crate::{ByVal, FIFO, LIFO, Listener};
     use alloc::rc::{Rc, Weak};
+    use alloc::vec::Vec;
     use core::array;
-    use core::cell::{Cell, OnceCell};
+    use core::cell::{Cell, OnceCell, RefCell};
     use core::pin::{Pin, pin};
     use core::ptr::NonNull;
 
-    struct Counter(Rc<Cell<u32>>);
+    struct CounterPolicy(Rc<Cell<u32>>);
 
-    impl Policy for Counter {
+    impl Policy for CounterPolicy {
+        type Ordering = LIFO;
         fn last_listener_cancelled(this: NonNull<Self>) { unsafe { this.as_ref() }.0.update(|x| x + 1); }
+    }
+
+    struct FifoPolicy;
+
+    impl Policy for FifoPolicy {
+        type Ordering = FIFO;
+        fn last_listener_cancelled(_: NonNull<Self>) {}
     }
 
     #[test]
     fn guard_drop_notifies_policy() {
         let ctr = Rc::new(Cell::new(0u32));
-        let reg = pin!(Registry::<ByVal<u32>, _>::new(Counter(ctr.clone())));
+        let reg = pin!(Registry::<ByVal<u32>, _>::new(CounterPolicy(ctr.clone())));
         let reg = reg.as_ref();
         let a = reg.register(|_| ());
         let b = reg.register(|_| ());
@@ -209,7 +244,7 @@ mod tests {
     #[test]
     fn self_cancel_notifies_policy() {
         let ctr = Rc::new(Cell::new(0u32));
-        let reg = pin!(Registry::<ByVal<u32>, _>::new(Counter(ctr.clone())));
+        let reg = pin!(Registry::<ByVal<u32>, _>::new(CounterPolicy(ctr.clone())));
         let reg = reg.as_ref();
         let guard = Rc::new(Cell::new(None));
         guard.set(Some(reg.register({
@@ -228,6 +263,7 @@ mod tests {
             empty_observed: Rc<Cell<bool>>,
         }
         impl Policy for Observer {
+            type Ordering = LIFO;
             fn last_listener_cancelled(this: NonNull<Self>) {
                 let this = unsafe { this.as_ref() };
                 let reg = this.reg.get().unwrap().upgrade().unwrap();
@@ -482,6 +518,32 @@ mod tests {
     }
 
     #[test]
+    fn self_cancel_then_nested_broadcast_lifo() { self_cancel_then_nested_broadcast(()); }
+
+    #[test]
+    fn self_cancel_then_nested_broadcast_fifo() { self_cancel_then_nested_broadcast(FifoPolicy); }
+
+    fn self_cancel_then_nested_broadcast<P: Policy + 'static>(policy: P) {
+        let reg = Rc::new(Registry::<ByVal<u32>, P>::new(policy));
+        let state = Rc::<State>::default();
+        let guard = Rc::new(Cell::new(None));
+        guard.set(Some(unsafe { Pin::new_unchecked(&*reg) }.register({
+            let (reg, state, me) = (Rc::downgrade(&reg), state.clone(), guard.clone());
+            move |depth| {
+                state.accept_count.update(|x| x + 1);
+                if depth == 0 {
+                    me.set(None);
+                    reg.upgrade().unwrap().broadcast(1);
+                }
+            }
+        })));
+        reg.broadcast(0);
+        assert_eq!(state.accept_count.get(), 1);
+        reg.broadcast(0);
+        assert_eq!(state.accept_count.get(), 1);
+    }
+
+    #[test]
     fn nested_broadcast_is_safe() {
         let reg = Rc::<Registry<ByVal<u32>>>::default();
         let state = Rc::<State>::default();
@@ -496,5 +558,60 @@ mod tests {
         });
         reg.broadcast(0);
         assert_eq!(state.accept_count.get(), 3);
+    }
+
+    #[test]
+    fn lifo_broadcast() {
+        let reg = pin!(Registry::<ByVal<u32>>::default());
+        let reg = reg.as_ref();
+        let order = Rc::new(RefCell::new(Vec::new()));
+        let _g: [_; 3] = array::from_fn(|i| {
+            let order = order.clone();
+            reg.register(move |_| order.borrow_mut().push(i))
+        });
+        reg.broadcast(0);
+        assert_eq!(*order.borrow(), [2, 1, 0]);
+    }
+
+    #[test]
+    fn fifo_broadcast() {
+        let reg = pin!(Registry::<ByVal<u32>, _>::new(FifoPolicy));
+        let reg = reg.as_ref();
+        let order = Rc::new(RefCell::new(Vec::new()));
+        let mut guards: [_; 5] = array::from_fn(|i| {
+            let order = order.clone();
+            Some(reg.register(move |_| order.borrow_mut().push(i)))
+        });
+        guards[2] = None;
+        reg.broadcast(0);
+        assert_eq!(*order.borrow(), [0, 1, 3, 4]);
+        guards[4] = None;
+        guards[0] = None;
+        let _g = reg.register({
+            let order = order.clone();
+            move |_| order.borrow_mut().push(9)
+        });
+        order.borrow_mut().clear();
+        reg.broadcast(0);
+        assert_eq!(*order.borrow(), [1, 3, 9]);
+    }
+
+    #[test]
+    fn fifo_reentrant_register_receives_inflight() {
+        let reg = Rc::new(Registry::<ByVal<u32>, FifoPolicy>::new(FifoPolicy));
+        let state = Rc::<State>::default();
+        let _g = unsafe { Pin::new_unchecked(&*reg) }.register({
+            let (reg, state, capturer) = (Rc::downgrade(&reg), state.clone(), OnceCell::new());
+            move |_| {
+                capturer.get_or_init(|| {
+                    let reg = reg.upgrade().unwrap();
+                    unsafe { Pin::new_unchecked(&*reg) }.register(Capturer(state.clone()))
+                });
+            }
+        });
+        reg.broadcast(0);
+        assert_eq!(state.accept_count.get(), 1);
+        reg.broadcast(0);
+        assert_eq!(state.accept_count.get(), 2);
     }
 }

@@ -1,4 +1,4 @@
-use crate::{ALIVE, EventFamily, Listener, RECURSIVE_CANCEL, RECURSIVE_VISIT};
+use crate::{ALIVE, EventFamily, LIFO, Listener, Ordering, RECURSIVE_CANCEL, RECURSIVE_VISIT, private};
 use alloc::boxed::Box;
 use core::cell::Cell;
 use core::marker::PhantomData;
@@ -8,6 +8,7 @@ use lock_api::RawMutex;
 
 pub trait Policy {
     type Sealable: Sealable;
+    type Ordering: Ordering;
 
     /// Called when `Sealable = Yes` and the last listener is cancelled (i.e. registry just became empty).
     /// Note that other threads may have already repopulated the registry before and during the call.
@@ -17,17 +18,15 @@ pub trait Policy {
 
 impl Policy for () {
     type Sealable = No;
+    type Ordering = LIFO;
     fn last_listener_cancelled(&self) {}
 }
 
 pub struct No;
 pub struct Yes;
 
-mod private {
-    pub trait Private {}
-    impl Private for super::No {}
-    impl Private for super::Yes {}
-}
+impl private::Private for No {}
+impl private::Private for Yes {}
 
 pub trait Sealable: private::Private {
     const VALUE: bool;
@@ -65,6 +64,7 @@ struct Inner<T: EventFamily, R: RawMutex, P: Policy> {
     sealed: Cell<<P::Sealable as Sealable>::Flag>,
     ref_count: Cell<usize>,
     head: Cell<*const ()>,
+    tail: Cell<<P::Ordering as Ordering>::Tail>,
     policy: P,
     _p: PhantomData<for<'a> fn(T::Event<'a>)>,
 }
@@ -90,14 +90,16 @@ unsafe fn resolve<T: EventFamily>(thin: *const ()) -> *const Node<T, dyn Listene
 }
 
 impl<T: EventFamily> Node<T, dyn Listener<T>> {
-    unsafe fn unlink(&self, head: &Cell<*const ()>) {
+    unsafe fn unlink<O: Ordering>(&self, head: &Cell<*const ()>, tail: &Cell<O::Tail>) {
         let (prev, next) = (self.prev.get(), self.next.get());
         if prev.is_null() {
             head.set(next);
         } else {
             unsafe { (*resolve::<T>(prev)).next.set(next) };
         }
-        if !next.is_null() {
+        if next.is_null() {
+            tail.set(O::into_tail(prev));
+        } else {
             unsafe { (*resolve::<T>(next)).prev.set(prev) };
         }
     }
@@ -149,7 +151,7 @@ impl<T: EventFamily, R: RawMutex, P: Policy> Drop for Guard<T, R, P> {
         let (destruct, free) = if state & ALIVE == 0 {
             (false, true)
         } else if state & !(RECURSIVE_VISIT - 1) == 0 {
-            unsafe { (*ptr).unlink(&parent.head) };
+            unsafe { (*ptr).unlink::<P::Ordering>(&parent.head, &parent.tail) };
             if <P::Sealable as Sealable>::VALUE && parent.head.get().is_null() {
                 unsafe { parent.lock.unlock() };
                 parent.policy.last_listener_cancelled();
@@ -189,7 +191,8 @@ impl<T: EventFamily, R: RawMutex, P: Policy> Registry<T, R, P> {
                 lock: R::INIT,
                 sealed: <_>::default(),
                 ref_count: Cell::new(1),
-                head: Cell::new(null()),
+                head: <_>::default(),
+                tail: <_>::default(),
                 policy,
                 _p: PhantomData,
             })),
@@ -208,12 +211,17 @@ impl<T: EventFamily, R: RawMutex, P: Policy> Registry<T, R, P> {
                 state: Cell::new(ALIVE),
                 listener: ManuallyDrop::new(listener),
             }) as Box<Node<T, dyn Listener<T>>>;
-            let next = inner.head.get();
-            *node.next.get_mut() = next;
+            let old = if <P::Ordering as Ordering>::FIFO { <P::Ordering as Ordering>::from_tail(inner.tail.get()) } else { inner.head.get() };
+            *if <P::Ordering as Ordering>::FIFO { node.prev.get_mut() } else { node.next.get_mut() } = old;
             let thin = Box::into_raw(node).cast_const().to_raw_parts().0;
-            inner.head.set(thin);
-            if !next.is_null() {
-                unsafe { &*resolve::<T>(next) }.prev.set(thin);
+            if <P::Ordering as Ordering>::FIFO {
+                if old.is_null() { &inner.head } else { &unsafe { &*resolve::<T>(old) }.next }.set(thin);
+                inner.tail.set(<P::Ordering as Ordering>::into_tail(thin));
+            } else {
+                inner.head.set(thin);
+                if !old.is_null() {
+                    unsafe { &*resolve::<T>(old) }.prev.set(thin);
+                }
             }
             inner.ref_count.update(|x| x + 1);
             Guard { node: thin, _p: PhantomData }
@@ -242,7 +250,7 @@ impl<T: EventFamily, R: RawMutex, P: Policy> Registry<T, R, P> {
             let next = node.next.get();
             state = node.state.get() - RECURSIVE_VISIT;
             if state & !(RECURSIVE_CANCEL - 1) == RECURSIVE_CANCEL {
-                unsafe { node.unlink(&inner.head) };
+                unsafe { node.unlink::<P::Ordering>(&inner.head, &inner.tail) };
                 node.next.set(deferred_cancels);
                 deferred_cancels = thin;
             } else {
@@ -283,9 +291,10 @@ impl<T: EventFamily, R: RawMutex, P: Policy<Sealable = Yes>> Registry<T, R, P> {
 mod tests {
     extern crate std;
 
-    use super::{Guard, Registry};
-    use crate::{ByVal, Listener};
+    use super::{Guard, No, Policy, Registry};
+    use crate::{ByVal, FIFO, Listener};
     use alloc::sync::Arc;
+    use alloc::vec::Vec;
     use core::array;
     use core::sync::atomic::Ordering::{Acquire, Relaxed, Release};
     use core::sync::atomic::{AtomicBool, AtomicU32};
@@ -313,6 +322,14 @@ mod tests {
     type NoSpinReg = Registry<ByVal<u32>, TestLock<false>>;
     type SpinReg = Registry<ByVal<u32>, TestLock<true>>;
     type GuardSlot = Mutex<TestLock<false>, Option<Guard<ByVal<u32>, TestLock<false>>>>;
+
+    struct FifoPolicy;
+
+    impl Policy for FifoPolicy {
+        type Sealable = No;
+        type Ordering = FIFO;
+        fn last_listener_cancelled(&self) {}
+    }
 
     #[derive(Default)]
     struct State {
@@ -577,5 +594,67 @@ mod tests {
             s.spawn(move || drop(guards));
         });
         assert_eq!(state.drop_count.load(Relaxed), 16);
+    }
+
+    type OrderLog = Mutex<TestLock<false>, Vec<usize>>;
+
+    #[test]
+    fn lifo_broadcast() {
+        let reg = NoSpinReg::default();
+        let order = Arc::new(Mutex::<TestLock<false>, _>::new(Vec::new()));
+        let _g: [_; 3] = array::from_fn(|i| {
+            let order = order.clone();
+            reg.register(move |_: u32| order.lock().push(i))
+        });
+        reg.broadcast(0);
+        assert_eq!(*order.lock(), [2, 1, 0]);
+    }
+
+    #[test]
+    fn fifo_broadcast() {
+        let reg = Registry::<ByVal<u32>, TestLock<false>, _>::new(FifoPolicy);
+        let order = Arc::new(OrderLog::new(Vec::new()));
+        let mut guards: [_; 5] = array::from_fn(|i| {
+            let order = order.clone();
+            Some(reg.register(move |_: u32| order.lock().push(i)))
+        });
+        guards[2] = None;
+        reg.broadcast(0);
+        assert_eq!(*order.lock(), [0, 1, 3, 4]);
+        guards[4] = None;
+        guards[0] = None;
+        let _g = reg.register({
+            let order = order.clone();
+            move |_: u32| order.lock().push(9)
+        });
+        order.lock().clear();
+        reg.broadcast(0);
+        assert_eq!(*order.lock(), [1, 3, 9]);
+    }
+
+    #[test]
+    fn fifo_concurrent_register_cancel_broadcast() {
+        let reg = Arc::new(Registry::<ByVal<u32>, TestLock<true>, _>::new(FifoPolicy));
+        let state = Arc::<State>::default();
+        thread::scope(|scope| {
+            for _ in 0..5 {
+                let reg = reg.clone();
+                scope.spawn(move || {
+                    for _ in 0..5 {
+                        reg.broadcast(1);
+                    }
+                });
+            }
+            for _ in 0..5 {
+                let (reg, state) = (reg.clone(), state.clone());
+                scope.spawn(move || {
+                    for _ in 0..5 {
+                        let guard = reg.register(Capturer(state.clone()));
+                        scope.spawn(move || drop(guard));
+                    }
+                });
+            }
+        });
+        assert_eq!(state.drop_count.load(Relaxed), 25);
     }
 }

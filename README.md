@@ -16,6 +16,8 @@ Events can be passed to listeners either by value with `ByVal<T>` (cloned
 per listener) or by reference with `ByRef<T>`. You can also implement the
 `EventFamily` yourself for event types that borrow from the sender's stack.
 
+Some features of each registry can be selected at compile time via the `Policy` trait.
+
 ## Reentrancy
 
 This implementation tolerates all kinds of recursive update scenarios.
@@ -28,7 +30,8 @@ The expected behaviors are listed below.
 - **Listener calling `broadcast` again in its callback (recursive notification)**\
   Callbacks for the new event will immediately run inside the nested `broadcast` call.
 - **Registering new listeners inside a listener callback**\
-  The new listeners will not receive the in-flight event.
+  With `LIFO` (default) ordering, the new listeners will not receive the in-flight event.
+  Otherwise (`FIFO`), they will.
 - **Accessing the registry in listener's destructor**\
   Listener's destructor may freely register, broadcast, or cancel any listener, including itself.
 
@@ -43,5 +46,4 @@ atomically confirm it is still empty and disable further registration.
 
 ## Caveats
 
-- The order in which the listeners run is unspecified.
 - This crate requires a nightly compiler (needed for accessing vtable pointers).
