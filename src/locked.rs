@@ -3,7 +3,7 @@ use alloc::boxed::Box;
 use core::cell::Cell;
 use core::marker::PhantomData;
 use core::mem::ManuallyDrop;
-use core::ptr::{self, DynMetadata, null};
+use core::ptr::{self, DynMetadata, NonNull, null};
 use lock_api::RawMutex;
 
 pub trait Policy {
@@ -50,12 +50,12 @@ impl Sealable for Yes {
 }
 
 pub struct Registry<T: EventFamily, R: RawMutex, P: Policy = ()> {
-    inner: *const Inner<T, R, P>,
+    inner: NonNull<Inner<T, R, P>>,
 }
 
 #[must_use]
 pub struct Guard<T: EventFamily, R: RawMutex, P: Policy = ()> {
-    node: *const (),
+    node: NonNull<()>,
     _p: PhantomData<Inner<T, R, P>>,
 }
 
@@ -77,7 +77,7 @@ unsafe impl<T: EventFamily, R: RawMutex, P: Policy> Sync for Guard<T, R, P> {}
 #[repr(C)]
 struct Node<T: EventFamily, L: Listener<T> + ?Sized> {
     meta: DynMetadata<dyn Listener<T>>,
-    parent: *const (),
+    parent: NonNull<()>,
     prev: Cell<*const ()>,
     next: Cell<*const ()>,
     state: Cell<usize>,
@@ -107,7 +107,7 @@ impl<T: EventFamily> Node<T, dyn Listener<T>> {
 
 impl<T: EventFamily, R: RawMutex, P: Policy> Drop for Registry<T, R, P> {
     fn drop(&mut self) {
-        let inner = unsafe { &*self.inner };
+        let inner = unsafe { self.inner.as_ref() };
         inner.lock.lock();
         let mut thin = inner.head.get();
         while !thin.is_null() {
@@ -132,7 +132,7 @@ impl<T: EventFamily, R: RawMutex, P: Policy> Drop for Registry<T, R, P> {
         let ref_count = inner.ref_count.get() - 1;
         if ref_count == 0 {
             // Unnecessary to unlock here.
-            drop(unsafe { Box::from_raw(self.inner.cast_mut()) });
+            drop(unsafe { Box::from_raw(self.inner.as_ptr()) });
         } else {
             inner.ref_count.set(ref_count);
             unsafe { inner.lock.unlock() };
@@ -143,9 +143,9 @@ impl<T: EventFamily, R: RawMutex, P: Policy> Drop for Registry<T, R, P> {
 impl<T: EventFamily, R: RawMutex, P: Policy> Drop for Guard<T, R, P> {
     /// May overlap listener destructor.
     fn drop(&mut self) {
-        let ptr = unsafe { resolve::<T>(self.node) };
-        let parent_ptr = unsafe { (*ptr).parent.cast::<Inner<T, R, P>>() };
-        let parent = unsafe { &*parent_ptr };
+        let ptr = unsafe { resolve::<T>(self.node.as_ptr()) };
+        let parent_ptr = unsafe { (*ptr).parent }.cast::<Inner<T, R, P>>();
+        let parent = unsafe { parent_ptr.as_ref() };
         parent.lock.lock();
         let state = unsafe { (*ptr).state.get() };
         let (destruct, free) = if state & ALIVE == 0 {
@@ -165,7 +165,7 @@ impl<T: EventFamily, R: RawMutex, P: Policy> Drop for Guard<T, R, P> {
         let ref_count = parent.ref_count.get() - 1;
         if ref_count == 0 {
             // Unnecessary to unlock here.
-            drop(unsafe { Box::from_raw(parent_ptr.cast_mut()) });
+            drop(unsafe { Box::from_raw(parent_ptr.as_ptr()) });
         } else {
             parent.ref_count.set(ref_count);
             unsafe { parent.lock.unlock() };
@@ -186,21 +186,20 @@ impl<T: EventFamily, R: RawMutex, P: Policy + Default> Default for Registry<T, R
 
 impl<T: EventFamily, R: RawMutex, P: Policy> Registry<T, R, P> {
     pub fn new(policy: P) -> Self {
-        Self {
-            inner: Box::into_raw(Box::new(Inner {
-                lock: R::INIT,
-                sealed: <_>::default(),
-                ref_count: Cell::new(1),
-                head: <_>::default(),
-                tail: <_>::default(),
-                policy,
-                _p: PhantomData,
-            })),
-        }
+        let inner = Box::new(Inner {
+            lock: R::INIT,
+            sealed: <_>::default(),
+            ref_count: Cell::new(1),
+            head: <_>::default(),
+            tail: <_>::default(),
+            policy,
+            _p: PhantomData,
+        });
+        Self { inner: unsafe { NonNull::new_unchecked(Box::into_raw(inner)) } }
     }
 
     pub fn register(&self, listener: impl Listener<T> + Send + Sync + 'static) -> <P::Sealable as Sealable>::RegisterResult<Guard<T, R, P>> {
-        let inner = unsafe { &*self.inner };
+        let inner = unsafe { self.inner.as_ref() };
         inner.lock.lock();
         let result = <P::Sealable as Sealable>::gate_register(inner.sealed.get(), || {
             let mut node = Box::new(Node {
@@ -224,14 +223,14 @@ impl<T: EventFamily, R: RawMutex, P: Policy> Registry<T, R, P> {
                 }
             }
             inner.ref_count.update(|x| x + 1);
-            Guard { node: thin, _p: PhantomData }
+            Guard { node: unsafe { NonNull::new_unchecked(thin.cast_mut()) }, _p: PhantomData }
         });
         unsafe { inner.lock.unlock() };
         result
     }
 
     pub fn broadcast(&self, event: T::Event<'_>) {
-        let inner = unsafe { &*self.inner };
+        let inner = unsafe { self.inner.as_ref() };
         inner.lock.lock();
         let mut deferred_cancels = null::<()>();
         let mut thin = inner.head.get();
@@ -276,7 +275,7 @@ impl<T: EventFamily, R: RawMutex, P: Policy> Registry<T, R, P> {
 impl<T: EventFamily, R: RawMutex, P: Policy<Sealable = Yes>> Registry<T, R, P> {
     /// Atomically check if the registry is empty, and if true, prevent it to ever become non-empty again.
     pub fn try_seal(&self) -> bool {
-        let inner = unsafe { &*self.inner };
+        let inner = unsafe { self.inner.as_ref() };
         inner.lock.lock();
         let empty = inner.head.get().is_null();
         if empty {

@@ -31,7 +31,7 @@ pub struct Registry<T: EventFamily, P: Policy = ()> {
 
 #[must_use]
 pub struct Guard<T: EventFamily, P: Policy = ()> {
-    node: *const (),
+    node: NonNull<()>,
     _p: PhantomData<*const Registry<T, P>>,
 }
 
@@ -99,7 +99,7 @@ impl<T: EventFamily, P: Policy> Drop for Registry<T, P> {
 impl<T: EventFamily, P: Policy> Drop for Guard<T, P> {
     /// May overlap listener destructor.
     fn drop(&mut self) {
-        let ptr = unsafe { resolve::<T>(self.node) };
+        let ptr = unsafe { resolve::<T>(self.node.as_ptr()) };
         let state = unsafe { (*ptr).state.get() };
         if state & ALIVE == 0 {
             drop(unsafe { Box::from_raw(ptr.cast_mut()) });
@@ -148,7 +148,7 @@ impl<T: EventFamily, P: Policy> Registry<T, P> {
                 unsafe { &*resolve::<T>(old) }.prev.set(thin);
             }
         }
-        Guard { node: thin, _p: PhantomData }
+        Guard { node: unsafe { NonNull::new_unchecked(thin.cast_mut()) }, _p: PhantomData }
     }
 
     fn walk(&self, mut f: impl FnMut(*const ()) -> *const ()) {
