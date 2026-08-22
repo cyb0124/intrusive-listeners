@@ -78,7 +78,7 @@ impl<T: EventFamily, P: Policy> Drop for Registry<T, P> {
     fn drop(&mut self) {
         self.walk(|thin| {
             let node = unsafe { &mut *resolve::<T>(thin).cast_mut() };
-            *node.state.get_mut() |= RECURSIVE_VISIT;
+            *node.state.get_mut() = RECURSIVE_VISIT;
             *node.next.get_mut()
         });
         self.walk(|thin| {
@@ -89,11 +89,23 @@ impl<T: EventFamily, P: Policy> Drop for Registry<T, P> {
             if *state & RECURSIVE_CANCEL != 0 {
                 drop(unsafe { Box::from_raw(ptr) });
             } else {
-                *state &= !ALIVE;
+                *state = 0;
             }
             next
         });
     }
+}
+
+impl<T: EventFamily, P: Policy> Guard<T, P> {
+    /// Obtain the pointer to the listener. It may be already destructed if
+    /// [`is_alive`](Self::is_alive) returns false, but the allocation stays valid.
+    pub fn as_ptr(&self) -> NonNull<dyn Listener<T>> {
+        let node = unsafe { resolve::<T>(self.node.as_ptr()) };
+        unsafe { NonNull::new_unchecked(&raw const (*node).listener as *mut dyn Listener<T>) }
+    }
+
+    /// Whether the listener hasn't been destructed (or about to be destructed) yet.
+    pub fn is_alive(&self) -> bool { unsafe { (*resolve::<T>(self.node.as_ptr())).state.get() & ALIVE != 0 } }
 }
 
 impl<T: EventFamily, P: Policy> Drop for Guard<T, P> {
@@ -101,9 +113,9 @@ impl<T: EventFamily, P: Policy> Drop for Guard<T, P> {
     fn drop(&mut self) {
         let ptr = unsafe { resolve::<T>(self.node.as_ptr()) };
         let state = unsafe { (*ptr).state.get() };
-        if state & ALIVE == 0 {
-            drop(unsafe { Box::from_raw(ptr.cast_mut()) });
-        } else if state & !(RECURSIVE_VISIT - 1) == 0 {
+        if state & !(RECURSIVE_VISIT - 1) != 0 {
+            unsafe { (*ptr).state.set(state | RECURSIVE_CANCEL) };
+        } else if state & ALIVE != 0 {
             let node = unsafe { &mut *ptr.cast_mut() };
             let registry = unsafe { node.unlink::<P::Ordering>() };
             if !registry.is_null() {
@@ -112,7 +124,7 @@ impl<T: EventFamily, P: Policy> Drop for Guard<T, P> {
             unsafe { ManuallyDrop::drop(&mut node.listener) };
             drop(unsafe { Box::from_raw(ptr.cast_mut()) });
         } else {
-            unsafe { (*ptr).state.set(state | RECURSIVE_CANCEL) };
+            drop(unsafe { Box::from_raw(ptr.cast_mut()) });
         }
     }
 }
@@ -613,5 +625,59 @@ mod tests {
         assert_eq!(state.accept_count.get(), 1);
         reg.broadcast(0);
         assert_eq!(state.accept_count.get(), 2);
+    }
+
+    #[test]
+    fn guard_as_ptr() {
+        let state = Rc::<State>::default();
+        let reg = pin!(Registry::<ByVal<u32>>::default());
+        let reg = reg.as_ref();
+        let guard = reg.register(Capturer(state.clone()));
+        assert!(guard.is_alive());
+        unsafe { guard.as_ptr().as_ref() }.accept(11);
+        assert_eq!(state.sum.get(), 11);
+        let downcast = unsafe { guard.as_ptr().cast::<Capturer>().as_ref() };
+        assert_eq!(downcast.0.accept_count.get(), 1);
+        reg.broadcast(22);
+        assert_eq!(state.sum.get(), 33);
+        let state = Rc::<State>::default();
+        let guard = {
+            let reg = pin!(Registry::<ByVal<u32>>::default());
+            reg.as_ref().register(Capturer(state.clone()))
+        };
+        assert_eq!(state.drop_count.get(), 1);
+        assert!(!guard.is_alive());
+    }
+
+    #[test]
+    fn is_alive_cleared_eagerly() {
+        struct State {
+            other: Cell<Option<Guard<ByVal<u32>>>>,
+            wrong: Cell<bool>,
+        }
+
+        struct Probe(Rc<State>);
+
+        impl Listener<ByVal<u32>> for Probe {
+            fn accept(&self, _: u32) {}
+        }
+
+        impl Drop for Probe {
+            fn drop(&mut self) {
+                let guard = self.0.other.take().unwrap();
+                self.0.wrong.set(guard.is_alive());
+                self.0.other.set(Some(guard));
+            }
+        }
+
+        let s0 = Rc::new(State { other: Cell::new(None), wrong: Cell::new(true) });
+        let s1 = Rc::new(State { other: Cell::new(None), wrong: Cell::new(true) });
+        {
+            let reg = pin!(Registry::<ByVal<u32>>::default());
+            let reg = reg.as_ref();
+            s0.other.set(Some(reg.register(Probe(s1.clone()))));
+            s1.other.set(Some(reg.register(Probe(s0.clone()))));
+        }
+        assert!(!s0.wrong.get() && !s1.wrong.get());
     }
 }

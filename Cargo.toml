@@ -1,6 +1,6 @@
 [package]
 name = "intrusive-listeners"
-version = "0.5.1"
+version = "0.6.0"
 edition = "2024"
 authors = ["Yibo Cao <cyb@ieee.org>"]
 description = "A compact reentrant type-erased event-listener registry"
