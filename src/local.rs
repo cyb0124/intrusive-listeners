@@ -104,7 +104,7 @@ impl<T: EventFamily, P: Policy> Guard<T, P> {
         unsafe { NonNull::new_unchecked(&raw const (*node).listener as *mut dyn Listener<T>) }
     }
 
-    /// Whether the listener hasn't been destructed (or about to be destructed) yet.
+    /// Whether the listener hasn't been (or about to be) destructed yet.
     pub fn is_alive(&self) -> bool { unsafe { (*resolve::<T>(self.node.as_ptr())).state.get() & ALIVE != 0 } }
 }
 

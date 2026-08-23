@@ -112,7 +112,7 @@ impl<T: EventFamily, R: RawMutex, P: Policy> Drop for Registry<T, R, P> {
         let mut thin = inner.head.get();
         while !thin.is_null() {
             let node = unsafe { &mut *resolve::<T>(thin).cast_mut() };
-            *node.state.get_mut() |= RECURSIVE_VISIT;
+            *node.state.get_mut() = RECURSIVE_VISIT;
             thin = *node.next.get_mut();
         }
         thin = inner.head.get();
@@ -126,7 +126,7 @@ impl<T: EventFamily, R: RawMutex, P: Policy> Drop for Registry<T, R, P> {
             if *state & RECURSIVE_CANCEL != 0 {
                 drop(unsafe { Box::from_raw(ptr) });
             } else {
-                *state &= !ALIVE;
+                *state = 0;
             }
         }
         let ref_count = inner.ref_count.get() - 1;
@@ -140,6 +140,27 @@ impl<T: EventFamily, R: RawMutex, P: Policy> Drop for Registry<T, R, P> {
     }
 }
 
+impl<T: EventFamily, R: RawMutex, P: Policy> Guard<T, R, P> {
+    /// Obtain the pointer to the listener. It may be already destructed, but the allocation stays valid.
+    pub fn as_ptr(&self) -> NonNull<dyn Listener<T>> {
+        let node = unsafe { resolve::<T>(self.node.as_ptr()) };
+        unsafe { NonNull::new_unchecked(&raw const (*node).listener as *mut dyn Listener<T>) }
+    }
+
+    /// If the listener hasn't been (or about to be) destructed yet, run the closure while keeping
+    /// the listener alive by holding the registry lock, so the closure should avoid expensive
+    /// operations as well as any recursive registry access (will deadlock).
+    pub fn enter<U>(&self, f: impl FnOnce(&dyn Listener<T>) -> U) -> Option<U> {
+        let ptr = unsafe { resolve::<T>(self.node.as_ptr()) };
+        let parent = unsafe { (*ptr).parent.cast::<Inner<T, R, P>>().as_ref() };
+        parent.lock.lock();
+        let alive = unsafe { (*ptr).state.get() } & ALIVE != 0;
+        let result = alive.then(|| f(unsafe { &*(&raw const (*ptr).listener as *mut dyn Listener<T>).cast_const() }));
+        unsafe { parent.lock.unlock() };
+        result
+    }
+}
+
 impl<T: EventFamily, R: RawMutex, P: Policy> Drop for Guard<T, R, P> {
     /// May overlap listener destructor.
     fn drop(&mut self) {
@@ -148,9 +169,10 @@ impl<T: EventFamily, R: RawMutex, P: Policy> Drop for Guard<T, R, P> {
         let parent = unsafe { parent_ptr.as_ref() };
         parent.lock.lock();
         let state = unsafe { (*ptr).state.get() };
-        let (destruct, free) = if state & ALIVE == 0 {
-            (false, true)
-        } else if state & !(RECURSIVE_VISIT - 1) == 0 {
+        let (destruct, dealloc) = if state & !(RECURSIVE_VISIT - 1) != 0 {
+            unsafe { (*ptr).state.set(state | RECURSIVE_CANCEL) };
+            (false, false)
+        } else if state & ALIVE != 0 {
             unsafe { (*ptr).unlink::<P::Ordering>(&parent.head, &parent.tail) };
             if <P::Sealable as Sealable>::VALUE && parent.head.get().is_null() {
                 unsafe { parent.lock.unlock() };
@@ -159,8 +181,7 @@ impl<T: EventFamily, R: RawMutex, P: Policy> Drop for Guard<T, R, P> {
             }
             (true, true)
         } else {
-            unsafe { (*ptr).state.set(state | RECURSIVE_CANCEL) };
-            (false, false)
+            (false, true)
         };
         let ref_count = parent.ref_count.get() - 1;
         if ref_count == 0 {
@@ -170,7 +191,7 @@ impl<T: EventFamily, R: RawMutex, P: Policy> Drop for Guard<T, R, P> {
             parent.ref_count.set(ref_count);
             unsafe { parent.lock.unlock() };
         }
-        if free {
+        if dealloc {
             let ptr = ptr.cast_mut();
             if destruct {
                 unsafe { ManuallyDrop::drop(&mut (*ptr).listener) };
