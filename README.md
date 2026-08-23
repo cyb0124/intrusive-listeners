@@ -1,11 +1,11 @@
 # intrusive-listeners
 
-An intrusive, type-erased event-listener registry for `no_std` with `alloc`.
+A compact reentrant type-erased event-listener registry for `no_std` with `alloc`.
 
-A `Registry<T>` holds a list of listeners for events of
-type `T::Event`. Each listener is registered through a pinned `&Registry`, where
-it is moved into a single heap allocation, type-erased to `dyn Listener<T>`,
-and referred to by a thin, one-word handle.
+A `Registry<T>` holds an intrusive list of variable-sized
+listeners for events of type `T::Event`, linked by thin pointers. Each listener
+is registered through a pinned `&Registry`, where it is moved into a single heap
+allocation, put into the list, and referred to by a single-word handle.
 
 The handle is returned as a `Guard` by `register`.
 It is an RAII scope guard that unregisters its listener when dropped. The
@@ -17,6 +17,9 @@ per listener) or by reference with `ByRef<T>`. You can also implement the
 `EventFamily` yourself for event types that borrow from the sender's stack.
 
 Some features of each registry can be selected at compile time via the `Policy` trait.
+The library also provides a `Future` adapter that yields the immediate next event
+for use by async code, but will not provide a `Stream` adapter since there is no
+queue or backpressure.
 
 ## Reentrancy
 

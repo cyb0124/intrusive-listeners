@@ -31,22 +31,22 @@ impl private::Private for Yes {}
 pub trait Sealable: private::Private {
     const VALUE: bool;
     type Flag: Copy + Default;
-    type RegisterResult<T>;
-    fn gate_register<T>(flag: Self::Flag, f: impl FnOnce() -> T) -> Self::RegisterResult<T>;
+    type IfNotSealed<T>;
+    fn if_not_sealed<T>(flag: Self::Flag, f: impl FnOnce() -> T) -> Self::IfNotSealed<T>;
 }
 
 impl Sealable for No {
     const VALUE: bool = false;
     type Flag = ();
-    type RegisterResult<T> = T;
-    fn gate_register<T>((): (), f: impl FnOnce() -> T) -> T { f() }
+    type IfNotSealed<T> = T;
+    fn if_not_sealed<T>((): (), f: impl FnOnce() -> T) -> T { f() }
 }
 
 impl Sealable for Yes {
     const VALUE: bool = true;
     type Flag = bool;
-    type RegisterResult<T> = Option<T>;
-    fn gate_register<T>(flag: bool, f: impl FnOnce() -> T) -> Option<T> { (!flag).then(f) }
+    type IfNotSealed<T> = Option<T>;
+    fn if_not_sealed<T>(flag: bool, f: impl FnOnce() -> T) -> Option<T> { (!flag).then(f) }
 }
 
 pub struct Registry<T: EventFamily, R: RawMutex, P: Policy = ()> {
@@ -72,7 +72,7 @@ struct Inner<T: EventFamily, R: RawMutex, P: Policy> {
 unsafe impl<T: EventFamily, R: RawMutex + Send + Sync, P: Policy + Send + Sync> Send for Registry<T, R, P> {}
 unsafe impl<T: EventFamily, R: RawMutex + Send + Sync, P: Policy + Send + Sync> Sync for Registry<T, R, P> {}
 unsafe impl<T: EventFamily, R: RawMutex + Send + Sync, P: Policy + Send + Sync> Send for Guard<T, R, P> {}
-unsafe impl<T: EventFamily, R: RawMutex, P: Policy> Sync for Guard<T, R, P> {}
+unsafe impl<T: EventFamily, R: RawMutex + Sync, P: Policy> Sync for Guard<T, R, P> {}
 
 #[repr(C)]
 struct Node<T: EventFamily, L: Listener<T> + ?Sized> {
@@ -219,10 +219,10 @@ impl<T: EventFamily, R: RawMutex, P: Policy> Registry<T, R, P> {
         Self { inner: unsafe { NonNull::new_unchecked(Box::into_raw(inner)) } }
     }
 
-    pub fn register(&self, listener: impl Listener<T> + Send + Sync + 'static) -> <P::Sealable as Sealable>::RegisterResult<Guard<T, R, P>> {
+    pub fn register(&self, listener: impl Listener<T> + Send + Sync + 'static) -> <P::Sealable as Sealable>::IfNotSealed<Guard<T, R, P>> {
         let inner = unsafe { self.inner.as_ref() };
         inner.lock.lock();
-        let result = <P::Sealable as Sealable>::gate_register(inner.sealed.get(), || {
+        let result = <P::Sealable as Sealable>::if_not_sealed(inner.sealed.get(), || {
             let mut node = Box::new(Node {
                 meta: ptr::metadata(&listener as &dyn Listener<T>),
                 parent: self.inner.cast::<()>(),
@@ -616,8 +616,6 @@ mod tests {
         assert_eq!(state.drop_count.load(Relaxed), 16);
     }
 
-    type OrderLog = Mutex<TestLock<false>, Vec<usize>>;
-
     #[test]
     fn lifo_broadcast() {
         let reg = NoSpinReg::default();
@@ -633,7 +631,7 @@ mod tests {
     #[test]
     fn fifo_broadcast() {
         let reg = Registry::<ByVal<u32>, TestLock<false>, _>::new(FifoPolicy);
-        let order = Arc::new(OrderLog::new(Vec::new()));
+        let order = Arc::new(Mutex::<TestLock<false>, _>::new(Vec::new()));
         let mut guards: [_; 5] = array::from_fn(|i| {
             let order = order.clone();
             Some(reg.register(move |_: u32| order.lock().push(i)))
