@@ -49,8 +49,8 @@
 #![no_std]
 #![feature(ptr_metadata)]
 
-use core::hint::unreachable_unchecked;
 use core::marker::PhantomData;
+use core::ptr::null;
 
 extern crate alloc;
 
@@ -111,7 +111,7 @@ pub trait Ordering: private::Private {
 impl Ordering for LIFO {
     type Tail = ();
     const FIFO: bool = false;
-    fn from_tail((): ()) -> *const () { unsafe { unreachable_unchecked() } }
+    fn from_tail((): ()) -> *const () { null() }
     fn into_tail(_: *const ()) {}
 }
 

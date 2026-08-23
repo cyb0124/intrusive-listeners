@@ -628,7 +628,7 @@ mod tests {
     }
 
     #[test]
-    fn guard_as_ptr() {
+    fn raw_ptr_access() {
         let state = Rc::<State>::default();
         let reg = pin!(Registry::<ByVal<u32>>::default());
         let reg = reg.as_ref();

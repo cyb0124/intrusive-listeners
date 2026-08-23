@@ -677,4 +677,32 @@ mod tests {
         });
         assert_eq!(state.drop_count.load(Relaxed), 25);
     }
+
+    #[test]
+    fn concurrent_raw_ptr_access() {
+        let state = Arc::<State>::default();
+        let reg = SpinReg::default();
+        let guard = reg.register(Capturer(state.clone()));
+        thread::scope(|scope| {
+            scope.spawn(|| (0..10).for_each(|_| reg.broadcast(1)));
+            scope.spawn(|| (0..10).for_each(|_| unsafe { guard.as_ptr().as_ref() }.accept(1)));
+        });
+        assert_eq!(state.accept_count.load(Relaxed), 20);
+        assert_eq!(state.sum.load(Relaxed), 20);
+    }
+
+    #[test]
+    fn scoped_raw_ptr_access() {
+        let state = Arc::<State>::default();
+        let reg = NoSpinReg::default();
+        let guard = reg.register(Capturer(state.clone()));
+        assert_eq!(guard.enter(|x| x.accept(5)), Some(()));
+        assert_eq!(state.sum.load(Relaxed), 5);
+        let guard = {
+            let reg = NoSpinReg::default();
+            reg.register(Capturer(state.clone()))
+        };
+        assert_eq!(state.drop_count.load(Relaxed), 1);
+        assert!(guard.enter(|_| ()).is_none());
+    }
 }
