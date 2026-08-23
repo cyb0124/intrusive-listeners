@@ -14,3 +14,7 @@ default = ["lock_api"]
 
 [dependencies]
 lock_api = { version = "0.4", default-features = false, optional = true }
+
+[dev-dependencies]
+futures-executor = "0.3"
+futures-task = "0.3"

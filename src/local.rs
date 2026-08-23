@@ -285,12 +285,14 @@ mod tests {
 
     use super::{Guard, Policy, Registry};
     use crate::{ByVal, FIFO, LIFO, Listener};
+    use alloc::boxed::Box;
     use alloc::rc::{Rc, Weak};
     use alloc::vec::Vec;
     use core::array;
     use core::cell::{Cell, OnceCell, RefCell};
     use core::pin::{Pin, pin};
     use core::ptr::NonNull;
+    use futures_task::{LocalFutureObj, LocalSpawn};
 
     struct CounterPolicy(Rc<Cell<u32>>);
 
@@ -748,5 +750,80 @@ mod tests {
             s1.other.set(Some(reg.register(Probe(s0.clone()))));
         }
         assert!(!s0.wrong.get() && !s1.wrong.get());
+    }
+
+    #[test]
+    fn next_polled_after_broadcast() {
+        futures_executor::block_on(async {
+            let reg = pin!(Registry::<ByVal<u32>>::default());
+            let reg = reg.as_ref();
+            let next = reg.next();
+            reg.broadcast(11);
+            reg.broadcast(22);
+            assert_eq!(next.await, Some(11));
+            assert!(reg.is_empty());
+        });
+    }
+
+    #[test]
+    fn next_polled_after_registry_drop() {
+        futures_executor::block_on(async {
+            let next = {
+                let reg = pin!(Registry::<ByVal<u32>>::default());
+                reg.as_ref().next()
+            };
+            assert_eq!(next.await, None);
+        });
+    }
+
+    #[test]
+    fn next_retains_result_after_registry_drop() {
+        futures_executor::block_on(async {
+            let data = Rc::new(5);
+            let next = {
+                let reg = pin!(Registry::<ByVal<Rc<u32>>>::default());
+                let reg = reg.as_ref();
+                let next = reg.next();
+                reg.broadcast(data.clone());
+                next
+            };
+            assert_eq!(next.await.as_deref(), Some(&5));
+            Rc::into_inner(data).unwrap();
+        });
+    }
+
+    #[test]
+    fn next_wakes_on_broadcast() {
+        let mut pool = futures_executor::LocalPool::new();
+        let reg = Box::pin(Registry::<ByVal<u32>>::default());
+        let result = Rc::new(Cell::new(None));
+        let task = {
+            let (next, result) = (reg.as_ref().next(), result.clone());
+            async move { result.set(Some(next.await)) }
+        };
+        pool.spawner().spawn_local_obj(LocalFutureObj::new(Box::pin(task))).unwrap();
+        pool.run_until_stalled();
+        assert_eq!(result.get(), None);
+        reg.as_ref().broadcast(5);
+        pool.run_until_stalled();
+        assert_eq!(result.get(), Some(Some(5)));
+        assert!(reg.is_empty());
+    }
+
+    #[test]
+    fn next_wakes_on_registry_drop() {
+        let mut pool = futures_executor::LocalPool::new();
+        let reg = Box::pin(Registry::<ByVal<u32>>::default());
+        let result = Rc::new(Cell::new(None));
+        let task = {
+            let (next, result) = (reg.as_ref().next(), result.clone());
+            async move { result.set(Some(next.await)) }
+        };
+        pool.spawner().spawn_local_obj(LocalFutureObj::new(Box::pin(task))).unwrap();
+        pool.run_until_stalled();
+        assert_eq!(result.get(), None);
+        drop(reg);
+        pool.run_until_stalled();
+        assert_eq!(result.get(), Some(None));
     }
 }
