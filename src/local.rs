@@ -1,10 +1,12 @@
 use crate::{ALIVE, EventFamily, LIFO, Listener, Ordering, RECURSIVE_CANCEL, RECURSIVE_VISIT};
 use alloc::boxed::Box;
-use core::cell::Cell;
+use core::cell::{Cell, UnsafeCell};
+use core::future::Future;
 use core::marker::{PhantomData, PhantomPinned};
-use core::mem::ManuallyDrop;
+use core::mem::{self, ManuallyDrop};
 use core::pin::Pin;
 use core::ptr::{self, DynMetadata, NonNull, null};
+use core::task::{Context, LocalWaker, Poll};
 
 pub trait Policy {
     type Ordering: Ordering;
@@ -206,6 +208,73 @@ impl<T: EventFamily, P: Policy> Registry<T, P> {
             deferred_cancels = *node.next.get_mut();
             unsafe { ManuallyDrop::drop(&mut node.listener) };
             drop(unsafe { Box::from_raw(ptr) });
+        }
+    }
+}
+
+impl<E: 'static, T: for<'a> EventFamily<Event<'a> = E> + 'static, P: Policy> Registry<T, P> {
+    /// Return a future that holds a listener to wait for the immediate next event.
+    /// The future will resolve to the event, or `None` if the registry is dropped.
+    pub fn next(self: Pin<&Self>) -> Next<E, T, P> {
+        Next { guard: self.register(NextListener(ManuallyDrop::new(UnsafeCell::new(NextState::Init)))), _p: PhantomData }
+    }
+}
+
+/// See [`Registry::next`].
+pub struct Next<E, T: EventFamily, P: Policy> {
+    guard: Guard<T, P>,
+    _p: PhantomData<E>,
+}
+
+enum NextState<E> {
+    Init,
+    Wait(LocalWaker),
+    Ready(E),
+    Dead,
+}
+
+#[repr(transparent)]
+struct NextListener<E>(ManuallyDrop<UnsafeCell<NextState<E>>>);
+
+impl<E, T: for<'a> EventFamily<Event<'a> = E> + 'static> Listener<T> for NextListener<E> {
+    fn accept(&self, event: E) {
+        let state = unsafe { &mut *self.0.get() };
+        if matches!(*state, NextState::Init | NextState::Wait(_)) {
+            if let NextState::Wait(waker) = mem::replace(state, NextState::Ready(event)) {
+                waker.wake();
+            }
+        }
+    }
+}
+
+impl<E> Drop for NextListener<E> {
+    fn drop(&mut self) {
+        let state = self.0.get_mut();
+        if matches!(*state, NextState::Init | NextState::Wait(_)) {
+            if let NextState::Wait(waker) = mem::replace(state, NextState::Dead) {
+                waker.wake();
+            }
+        }
+    }
+}
+
+impl<E, T: EventFamily, P: Policy> Drop for Next<E, T, P> {
+    fn drop(&mut self) { let _defer = mem::replace(unsafe { self.guard.as_ptr().cast::<NextState<E>>().as_mut() }, NextState::Dead); }
+}
+
+impl<E, T: for<'a> EventFamily<Event<'a> = E> + 'static, P: Policy> Future for Next<E, T, P> {
+    type Output = Option<E>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<E>> {
+        let mut state = self.guard.as_ptr().cast::<NextState<E>>();
+        let waker = matches!(unsafe { state.as_ref() }, NextState::Init | NextState::Wait(_)).then(|| cx.local_waker().clone());
+        // State may have changed if the waker's `clone` impl for whatever reason touches the registry.
+        let state = unsafe { state.as_mut() };
+        if matches!(*state, NextState::Init | NextState::Wait(_)) {
+            let _defer = mem::replace(state, NextState::Wait(unsafe { waker.unwrap_unchecked() }));
+            Poll::Pending
+        } else {
+            Poll::Ready(if let NextState::Ready(event) = mem::replace(state, NextState::Dead) { Some(event) } else { None })
         }
     }
 }
