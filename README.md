@@ -47,3 +47,4 @@ atomically confirm it is still empty and disable further registration.
 ## Caveats
 
 - This crate requires a nightly compiler (needed for accessing vtable pointers).
+- Does not support panic-unwind. Although unwinding shouldn't cause UB, it will cause leaks and deadlocks.

@@ -45,6 +45,7 @@
 //! # Caveats
 //!
 //! - This crate requires a nightly compiler (needed for accessing vtable pointers).
+//! - Does not support panic-unwind. Although unwinding shouldn't cause UB, it will cause leaks and deadlocks.
 
 #![no_std]
 #![feature(ptr_metadata)]
