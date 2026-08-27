@@ -34,25 +34,28 @@ impl private::Private for Yes {}
 pub trait Sealable: private::Private {
     const VALUE: bool;
     type Flag: Copy + Default;
-    type IfNotSealed<T>;
-    fn if_not_sealed<T>(flag: Self::Flag, f: impl FnOnce() -> T) -> Self::IfNotSealed<T>;
-    fn map<T, U>(x: Self::IfNotSealed<T>, f: impl FnOnce(T) -> U) -> Self::IfNotSealed<U>;
+    type OkIfNotSealed<T, E>;
+    type SomeIfNotSealed<T>;
+    fn if_not_sealed<T, E>(flag: Self::Flag, x: E, f: impl FnOnce(E) -> T) -> Self::OkIfNotSealed<T, E>;
+    fn map<T, U, E>(x: Self::OkIfNotSealed<T, E>, f: impl FnOnce(T) -> U, g: impl FnOnce(E)) -> Self::SomeIfNotSealed<U>;
 }
 
 impl Sealable for No {
     const VALUE: bool = false;
     type Flag = ();
-    type IfNotSealed<T> = T;
-    fn if_not_sealed<T>((): (), f: impl FnOnce() -> T) -> T { f() }
-    fn map<T, U>(x: T, f: impl FnOnce(T) -> U) -> U { f(x) }
+    type OkIfNotSealed<T, E> = T;
+    type SomeIfNotSealed<T> = T;
+    fn if_not_sealed<T, E>((): (), x: E, f: impl FnOnce(E) -> T) -> T { f(x) }
+    fn map<T, U, E>(x: T, f: impl FnOnce(T) -> U, _: impl FnOnce(E)) -> U { f(x) }
 }
 
 impl Sealable for Yes {
     const VALUE: bool = true;
     type Flag = bool;
-    type IfNotSealed<T> = Option<T>;
-    fn if_not_sealed<T>(flag: bool, f: impl FnOnce() -> T) -> Option<T> { (!flag).then(f) }
-    fn map<T, U>(x: Option<T>, f: impl FnOnce(T) -> U) -> Option<U> { x.map(f) }
+    type OkIfNotSealed<T, E> = Result<T, E>;
+    type SomeIfNotSealed<T> = Option<T>;
+    fn if_not_sealed<T, E>(flag: bool, x: E, f: impl FnOnce(E) -> T) -> Result<T, E> { if flag { Err(x) } else { Ok(f(x)) } }
+    fn map<T, U, E>(x: Result<T, E>, f: impl FnOnce(T) -> U, g: impl FnOnce(E)) -> Option<U> { x.map_err(g).ok().map(f) }
 }
 
 pub struct Registry<T: EventFamily, R: RawMutex, P: Policy = ()> {
@@ -225,10 +228,10 @@ impl<T: EventFamily, R: RawMutex, P: Policy> Registry<T, R, P> {
         Self { inner: unsafe { NonNull::new_unchecked(Box::into_raw(inner)) } }
     }
 
-    pub fn register(&self, listener: impl Listener<T> + Send + Sync + 'static) -> <P::Sealable as Sealable>::IfNotSealed<Guard<T, R, P>> {
+    pub fn register<L: Listener<T> + Send + Sync + 'static>(&self, listener: L) -> <P::Sealable as Sealable>::OkIfNotSealed<Guard<T, R, P>, L> {
         let inner = unsafe { self.inner.as_ref() };
         inner.lock.lock();
-        let result = <P::Sealable as Sealable>::if_not_sealed(inner.sealed.get(), || {
+        let result = <P::Sealable as Sealable>::if_not_sealed(inner.sealed.get(), listener, |listener| {
             let mut node = Box::new(Node {
                 meta: ptr::metadata(&listener as &dyn Listener<T>),
                 parent: self.inner.cast::<()>(),
@@ -316,10 +319,10 @@ impl<T: EventFamily, R: RawMutex, P: Policy<Sealable = Yes>> Registry<T, R, P> {
 impl<E: Send + 'static, T: for<'a> EventFamily<Event<'a> = E> + 'static, R: RawMutex + Send + Sync + 'static, P: Policy> Registry<T, R, P> {
     /// Return a future that holds a listener to wait for the immediate next event.
     /// The future will resolve to the event, or `None` if the registry is dropped.
-    pub fn next(&self) -> <P::Sealable as Sealable>::IfNotSealed<Next<E, T, R, P>> {
+    pub fn next(&self) -> <P::Sealable as Sealable>::SomeIfNotSealed<Next<E, T, R, P>> {
         let shared = NextShared { lock: R::INIT, ref_count: 2, state: NextState::Init };
         let guard = self.register(NextListener(ManuallyDrop::new(UnsafePinned::new(shared))));
-        <P::Sealable as Sealable>::map(guard, |guard| Next { guard, _p: PhantomData })
+        <P::Sealable as Sealable>::map(guard, |guard| Next { guard, _p: PhantomData }, |e| unsafe { ManuallyDrop::drop(&mut ManuallyDrop::new(e).0) })
     }
 }
 
