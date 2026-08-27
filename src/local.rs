@@ -1,10 +1,10 @@
 use crate::{ALIVE, EventFamily, LIFO, Listener, Ordering, RECURSIVE_CANCEL, RECURSIVE_VISIT};
 use alloc::boxed::Box;
-use core::cell::{Cell, UnsafeCell};
+use core::cell::Cell;
 use core::future::Future;
 use core::marker::{PhantomData, PhantomPinned};
 use core::mem::{self, ManuallyDrop};
-use core::pin::Pin;
+use core::pin::{Pin, UnsafePinned};
 use core::ptr::{self, DynMetadata, NonNull, null};
 use core::task::{Context, LocalWaker, Poll};
 
@@ -216,7 +216,7 @@ impl<E: 'static, T: for<'a> EventFamily<Event<'a> = E> + 'static, P: Policy> Reg
     /// Return a future that holds a listener to wait for the immediate next event.
     /// The future will resolve to the event, or `None` if the registry is dropped.
     pub fn next(self: Pin<&Self>) -> Next<E, T, P> {
-        Next { guard: self.register(NextListener(ManuallyDrop::new(UnsafeCell::new(NextState::Init)))), _p: PhantomData }
+        Next { guard: self.register(NextListener(ManuallyDrop::new(UnsafePinned::new(NextState::Init)))), _p: PhantomData }
     }
 }
 
@@ -234,7 +234,7 @@ enum NextState<E> {
 }
 
 #[repr(transparent)]
-struct NextListener<E>(ManuallyDrop<UnsafeCell<NextState<E>>>);
+struct NextListener<E>(ManuallyDrop<UnsafePinned<NextState<E>>>);
 
 impl<E, T: for<'a> EventFamily<Event<'a> = E> + 'static> Listener<T> for NextListener<E> {
     fn accept(&self, event: E) {
@@ -249,7 +249,7 @@ impl<E, T: for<'a> EventFamily<Event<'a> = E> + 'static> Listener<T> for NextLis
 
 impl<E> Drop for NextListener<E> {
     fn drop(&mut self) {
-        let state = self.0.get_mut();
+        let state = unsafe { &mut *self.0.get() };
         if matches!(*state, NextState::Init | NextState::Wait(_)) {
             if let NextState::Wait(waker) = mem::replace(state, NextState::Dead) {
                 waker.wake();
