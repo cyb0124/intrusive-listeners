@@ -815,4 +815,63 @@ mod tests {
         assert_eq!(state.drop_count.load(Relaxed), 1);
         assert!(guard.enter(|_| ()).is_none());
     }
+
+    #[test]
+    fn next_polled_after_broadcast() {
+        futures_executor::block_on(async {
+            let reg = NoSpinReg::default();
+            let next = reg.next();
+            reg.broadcast(11);
+            reg.broadcast(22);
+            assert_eq!(next.await, Some(11));
+        });
+    }
+
+    #[test]
+    fn next_polled_after_registry_drop() {
+        futures_executor::block_on(async {
+            let next = NoSpinReg::default().next();
+            assert_eq!(next.await, None);
+        });
+    }
+
+    #[test]
+    fn next_retains_result_after_registry_drop() {
+        futures_executor::block_on(async {
+            let data = Arc::new(5);
+            let next = {
+                let reg = Registry::<ByVal<Arc<u32>>, TestLock<false>>::default();
+                let next = reg.next();
+                reg.broadcast(data.clone());
+                next
+            };
+            assert_eq!(next.await.as_deref(), Some(&5));
+            Arc::into_inner(data).unwrap();
+        });
+    }
+
+    #[test]
+    fn concurrent_next_broadcast() {
+        let reg = SpinReg::default();
+        let next = reg.next();
+        thread::scope(|s| {
+            let next = s.spawn(|| futures_executor::block_on(next));
+            s.spawn(|| {
+                reg.broadcast(123);
+                reg.broadcast(456);
+            });
+            assert_eq!(next.join().unwrap(), Some(123));
+        });
+    }
+
+    #[test]
+    fn concurrent_next_registry_drop() {
+        let reg = SpinReg::default();
+        let next = reg.next();
+        thread::scope(|s| {
+            let next = s.spawn(|| futures_executor::block_on(next));
+            s.spawn(|| drop(reg));
+            assert_eq!(next.join().unwrap(), None);
+        });
+    }
 }
