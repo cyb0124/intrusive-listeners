@@ -51,7 +51,7 @@
 //! - Does not support panic-unwind. Although unwinding shouldn't cause UB, it will cause leaks and deadlocks.
 
 #![no_std]
-#![feature(ptr_metadata, local_waker)]
+#![feature(ptr_metadata, local_waker, unsafe_pinned)]
 
 use core::marker::PhantomData;
 use core::ptr::null;

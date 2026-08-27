@@ -258,15 +258,19 @@ impl<E> Drop for NextListener<E> {
     }
 }
 
+impl<E, T: EventFamily, P: Policy> Next<E, T, P> {
+    fn state(&self) -> NonNull<NextState<E>> { self.guard.as_ptr().cast() }
+}
+
 impl<E, T: EventFamily, P: Policy> Drop for Next<E, T, P> {
-    fn drop(&mut self) { let _defer = mem::replace(unsafe { self.guard.as_ptr().cast::<NextState<E>>().as_mut() }, NextState::Dead); }
+    fn drop(&mut self) { let _defer = mem::replace(unsafe { self.state().as_mut() }, NextState::Dead); }
 }
 
 impl<E, T: for<'a> EventFamily<Event<'a> = E> + 'static, P: Policy> Future for Next<E, T, P> {
     type Output = Option<E>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<E>> {
-        let mut state = self.guard.as_ptr().cast::<NextState<E>>();
+        let mut state = self.state();
         let waker = matches!(unsafe { state.as_ref() }, NextState::Init | NextState::Wait(_)).then(|| cx.local_waker().clone());
         // State may have changed if the waker's `clone` impl for whatever reason touches the registry.
         let state = unsafe { state.as_mut() };

@@ -1,9 +1,12 @@
 use crate::{ALIVE, EventFamily, LIFO, Listener, Ordering, RECURSIVE_CANCEL, RECURSIVE_VISIT, private};
 use alloc::boxed::Box;
 use core::cell::Cell;
+use core::future::Future;
 use core::marker::PhantomData;
-use core::mem::ManuallyDrop;
+use core::mem::{self, ManuallyDrop};
+use core::pin::{Pin, UnsafePinned};
 use core::ptr::{self, DynMetadata, NonNull, null};
+use core::task::{Context, Poll, Waker};
 use lock_api::RawMutex;
 
 pub trait Policy {
@@ -33,6 +36,7 @@ pub trait Sealable: private::Private {
     type Flag: Copy + Default;
     type IfNotSealed<T>;
     fn if_not_sealed<T>(flag: Self::Flag, f: impl FnOnce() -> T) -> Self::IfNotSealed<T>;
+    fn map<T, U>(x: Self::IfNotSealed<T>, f: impl FnOnce(T) -> U) -> Self::IfNotSealed<U>;
 }
 
 impl Sealable for No {
@@ -40,6 +44,7 @@ impl Sealable for No {
     type Flag = ();
     type IfNotSealed<T> = T;
     fn if_not_sealed<T>((): (), f: impl FnOnce() -> T) -> T { f() }
+    fn map<T, U>(x: T, f: impl FnOnce(T) -> U) -> U { f(x) }
 }
 
 impl Sealable for Yes {
@@ -47,6 +52,7 @@ impl Sealable for Yes {
     type Flag = bool;
     type IfNotSealed<T> = Option<T>;
     fn if_not_sealed<T>(flag: bool, f: impl FnOnce() -> T) -> Option<T> { (!flag).then(f) }
+    fn map<T, U>(x: Option<T>, f: impl FnOnce(T) -> U) -> Option<U> { x.map(f) }
 }
 
 pub struct Registry<T: EventFamily, R: RawMutex, P: Policy = ()> {
@@ -148,7 +154,7 @@ impl<T: EventFamily, R: RawMutex, P: Policy> Guard<T, R, P> {
     }
 
     /// If the listener hasn't been (or about to be) destructed yet, run the closure while keeping
-    /// the listener alive by holding the registry lock, so the closure should avoid expensive
+    /// the listener alive by holding the registry lock. The closure should avoid expensive
     /// operations as well as any recursive registry access (will deadlock).
     pub fn enter<U>(&self, f: impl FnOnce(&dyn Listener<T>) -> U) -> Option<U> {
         let ptr = unsafe { resolve::<T>(self.node.as_ptr()) };
@@ -304,6 +310,112 @@ impl<T: EventFamily, R: RawMutex, P: Policy<Sealable = Yes>> Registry<T, R, P> {
         }
         unsafe { inner.lock.unlock() };
         empty
+    }
+}
+
+impl<E: Send + 'static, T: for<'a> EventFamily<Event<'a> = E> + 'static, R: RawMutex + Send + Sync + 'static, P: Policy> Registry<T, R, P> {
+    /// Return a future that holds a listener to wait for the immediate next event.
+    /// The future will resolve to the event, or `None` if the registry is dropped.
+    pub fn next(&self) -> <P::Sealable as Sealable>::IfNotSealed<Next<E, T, R, P>> {
+        let shared = NextShared { lock: R::INIT, ref_count: 2, state: NextState::Init };
+        let guard = self.register(NextListener(ManuallyDrop::new(UnsafePinned::new(shared))));
+        <P::Sealable as Sealable>::map(guard, |guard| Next { guard, _p: PhantomData })
+    }
+}
+
+/// See [`Registry::next`].
+pub struct Next<E, T: EventFamily, R: RawMutex, P: Policy> {
+    guard: Guard<T, R, P>,
+    _p: PhantomData<E>,
+}
+
+enum NextState<E> {
+    Init,
+    Wait(Waker),
+    Ready(E),
+    Dead,
+}
+
+struct NextShared<E, R: RawMutex> {
+    lock: R,
+    ref_count: u8,
+    state: NextState<E>,
+}
+
+#[repr(transparent)]
+struct NextListener<E, R: RawMutex>(ManuallyDrop<UnsafePinned<NextShared<E, R>>>);
+
+unsafe impl<E: Send, R: RawMutex + Send + Sync> Send for NextListener<E, R> {}
+unsafe impl<E: Send, R: RawMutex + Send + Sync> Sync for NextListener<E, R> {}
+
+impl<E, R: RawMutex> NextShared<E, R> {
+    fn enter<U>(this: *mut Self, decr: bool, f: impl FnOnce(&mut NextState<E>) -> U) -> U {
+        let lock = unsafe { &(*this).lock };
+        lock.lock();
+        let result = f(unsafe { &mut (*this).state });
+        let destruct = decr && {
+            unsafe { (*this).ref_count -= 1 };
+            (unsafe { (*this).ref_count }) == 0
+        };
+        match destruct {
+            false => unsafe { lock.unlock() },
+            true => unsafe { ptr::drop_in_place(this) },
+        }
+        result
+    }
+}
+
+impl<E, T: for<'a> EventFamily<Event<'a> = E> + 'static, R: RawMutex> Listener<T> for NextListener<E, R> {
+    fn accept(&self, event: E) {
+        let result = NextShared::enter(self.0.get(), false, |state| {
+            if matches!(*state, NextState::Init | NextState::Wait(_)) {
+                mem::replace(state, NextState::Ready(event))
+            } else {
+                NextState::Ready(event)
+            }
+        });
+        if let NextState::Wait(waker) = result {
+            waker.wake();
+        }
+    }
+}
+
+impl<E, R: RawMutex> Drop for NextListener<E, R> {
+    fn drop(&mut self) {
+        let result = NextShared::enter(self.0.get(), true, |state| {
+            matches!(*state, NextState::Init | NextState::Wait(_)).then(|| mem::replace(state, NextState::Dead))
+        });
+        if let Some(NextState::Wait(waker)) = result {
+            waker.wake();
+        }
+    }
+}
+
+impl<E, T: EventFamily, R: RawMutex, P: Policy> Next<E, T, R, P> {
+    fn shared(&self) -> *mut NextShared<E, R> { self.guard.as_ptr().cast().as_ptr() }
+}
+
+impl<E, T: EventFamily, R: RawMutex, P: Policy> Drop for Next<E, T, R, P> {
+    fn drop(&mut self) { let _defer = NextShared::enter(self.shared(), true, |state| mem::replace(state, NextState::Dead)); }
+}
+
+impl<E, T: for<'a> EventFamily<Event<'a> = E> + 'static, R: RawMutex, P: Policy> Future for Next<E, T, R, P> {
+    type Output = Option<E>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<E>> {
+        let waker = cx.waker().clone();
+        let (result, _refused) = NextShared::enter(self.shared(), false, |state| {
+            if matches!(*state, NextState::Init | NextState::Wait(_)) {
+                (mem::replace(state, NextState::Wait(waker)), None)
+            } else {
+                (mem::replace(state, NextState::Dead), Some(waker))
+            }
+        });
+        match result {
+            NextState::Init | NextState::Wait(_) => Poll::Pending,
+            NextState::Ready(event) => Poll::Ready(Some(event)),
+            NextState::Dead => Poll::Ready(None),
+        }
     }
 }
 
